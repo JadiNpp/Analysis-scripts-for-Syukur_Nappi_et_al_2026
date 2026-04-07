@@ -1,5 +1,5 @@
 ---
-title: "Syukur_Nappi_et_al_paper_2026 - Not all children are the same: Differences in the microbiome assembly during early development of seaweeds"
+title: "Syukur/Nappi_et_al_paper_2026"
 author: "Jadranka Nappi"
 date: "2026-02-24"
 output: html_document
@@ -759,7 +759,7 @@ genus_df %>%
 
 ## Use of Atchinson - PCOA and Sorensen (P/A) PCOA
 ```{r}
-# 1️⃣ Subset metadata (study = second)
+# 1 Subset metadata (study = second)
 # ----------------------------------
 metadata_second <- fact_reordered %>%
   as.data.frame() %>%
@@ -769,19 +769,19 @@ metadata_second <- fact_reordered %>%
 samples_second <- metadata_second$sample_ID
 
 # ----------------------------------
-# 2️⃣ Subset RAW count matrix
+# 1 Subset RAW count matrix
 # ----------------------------------
 asv_raw_second <- asv_abund_final_clean[, samples_second, drop = FALSE]
 
 # ----------------------------------
-# 3️⃣ Add pseudocount + CLR transform
+# 3 Add pseudocount + CLR transform
 # ----------------------------------
 asv_clr_second <- t(apply(asv_raw_second + 1, 2, function(x) {
   log(x) - mean(log(x))
 }))
 
 # ----------------------------------
-# 4️⃣ Aitchison distance + PCoA
+# 4 Aitchison distance + PCoA
 # ----------------------------------
 aitchison_dist_second <- dist(asv_clr_second, method = "euclidean")
 
@@ -794,7 +794,7 @@ colnames(pcoa_scores_second) <- c("PCoA1", "PCoA2")
 pcoa_scores_second$sample_ID <- rownames(pcoa_scores_second)
 
 # ----------------------------------
-# 5️⃣ Merge metadata
+# 5 Merge metadata
 # ----------------------------------
 pcoa_plot_df_second <- pcoa_scores_second %>%
   left_join(metadata_second, by = "sample_ID") %>%
@@ -804,7 +804,7 @@ pcoa_plot_df_second <- pcoa_scores_second %>%
   )
 
 # ----------------------------------
-# 6️⃣ SAME colour & shape settings as NMDS
+# 6 SAME colour & shape settings as NMDS
 # ----------------------------------
 
 # Same stage colour logic (Set1)
@@ -818,13 +818,13 @@ shape_map <- setNames(manual_shapes[seq_along(sample_type_levels)],
                       sample_type_levels)
 
 # ----------------------------------
-# 7️⃣ Variance explained
+# 7 Variance explained
 # ----------------------------------
 eig_vals <- pcoa_second$eig
 var_explained <- round(100 * eig_vals / sum(eig_vals), 2)
 
 # ----------------------------------
-# 8️⃣ Plot
+# 8 Plot
 # ----------------------------------
 PCOA_Atchinson_second <- ggplot(pcoa_plot_df_second,
        aes(x = PCoA1, y = PCoA2,
@@ -3155,13 +3155,6 @@ dev.off()
 #Delisea
 ```{r}
 # ---- HEATMAP: Delisea (REL ABUND %, gamma colours up to 90%, linear-looking legend) ----
-# Fixes included:
-#  ✅ colours come from gamma-transformed matrix (more warm colours for low values)
-#  ✅ legend tick labels stay in % (0–100)
-#  ✅ zeros plotted black (NA in colour matrix only)
-#  ✅ numbers NEVER mismatch colours (num_mat created at the VERY END after all reordering)
-#  ✅ avoids "red cell with 0.0" misalignment bug
-#  ✅ annotation data.frame is bulletproof (never becomes vector)
 # 1) Select Delisea samples
 # -----------------------------------------------------------
 meta_dp <- fact_cleaned_with_new_samples %>%
@@ -3576,12 +3569,6 @@ dev.off()
 
 ```{r}
 # ---- HEATMAP: Hormosira (REL ABUND %, gamma colours up to 90%, linear-looking legend) ----
-# Same approach as Delisea:
-#  ✅ colours from gamma-transformed matrix (more warm colours for low values)
-#  ✅ legend tick labels in % (0–90 positioned correctly in transformed space
-#  ✅ zeros plotted black (NA in colour matrix only)
-#  ✅ numbers NEVER mismatch colours (num_mat created at the VERY END after all reordering)
-#  ✅ annotation data.frame is bulletproof (never becomes vector)
 # 1) Select Hormosira samples (H.banksii_24 + H.banksii_26)
 # -----------------------------------------------------------
 meta_hb <- fact_cleaned_with_new_samples %>%
@@ -4373,3 +4360,6 @@ names_diff_pvalue_adj <- names(significant_adjusted_p_values)
 
 
 ```
+
+   
+  
