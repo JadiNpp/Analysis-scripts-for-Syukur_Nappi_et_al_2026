@@ -1,0 +1,4375 @@
+---
+title: "Syukur_Nappi_et_al_paper_2026 - Not all children are the same: Differences in the microbiome assembly during early development of seaweeds"
+author: "Jadranka Nappi"
+date: "2026-02-24"
+output: html_document
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+  eval = TRUE,
+  echo = FALSE,
+  message = FALSE,
+  warning = TRUE,
+  include = FALSE
+)
+
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(patchwork)
+library(vegan)
+library(lme4)
+library(multcomp)
+library(multcompView)
+library(lsmeans)
+library(mvabund)
+library(DESeq2)
+library(sandwich)
+library(RColorBrewer)
+library(pheatmap)
+library(ComplexHeatmap)
+library(circlize)
+library(ggsci)
+library(ggpubr)
+library(gplots)
+library(gtable)
+library(scales)
+library(ellipse)
+library(iNEXT.3D)
+library(gtools)
+library(grid)
+library(png)
+library(magick)
+```
+
+
+## Load data
+```{r}
+ASV_data <- read.csv("outputs/files/AllSamples_unoise_otu_table_BLCA_filtered2.csv")
+fact <- read.csv("outputs/files/metadata_all_JN.csv")
+
+# Libraries used for clear, readable data manipulation
+
+# Create a cleaned copy (do NOT overwrite ASV_data)
+ASV_data_cleaned <- ASV_data %>%
+  # 1) Rename the first column from "X.OTU.ID" to "ASV_ID"
+  dplyr::rename(ASV_ID = `X.OTU.ID`) %>%
+  # 2) Replace all values starting with "Zotu" with "ASV" in the ASV_ID column
+  mutate(ASV_ID = str_replace(ASV_ID, "^Zotu", "ASV"))
+
+# 3) Replace "." with "_" in all column names EXCEPT the first one (ASV_ID)
+new_names <- names(ASV_data_cleaned)
+new_names[-1] <- str_replace_all(new_names[-1], "\\.", "_")
+ASV_data_cleaned <- setNames(ASV_data_cleaned, new_names)
+
+# (Optional) If your data ALSO has rownames that start with "Zotu", clean those too.
+# This is separate from the first column, and only applies if rownames exist.
+ASV_data_cleaned_with_rownames <- ASV_data_cleaned
+rownames(ASV_data_cleaned_with_rownames) <- str_replace(
+  rownames(ASV_data_cleaned_with_rownames),
+  "^Zotu", "ASV"
+)
+
+# Create a new cleaned object (do NOT overwrite)
+ASV_cleaned_sampleNames_trimmed <- ASV_data_cleaned
+
+# Extract column names
+asv_colnames <- colnames(ASV_cleaned_sampleNames_trimmed)
+
+# Remove everything from "_S" onward, except for ASV_ID
+asv_colnames[-1] <- str_remove(asv_colnames[-1], "_S.*")
+
+# Assign cleaned names back
+colnames(ASV_cleaned_sampleNames_trimmed) <- asv_colnames
+
+ASV_cleaned <- ASV_cleaned_sampleNames_trimmed 
+
+# Create a new cleaned metadata object
+fact_sampleNames_trimmed <- fact
+
+# Remove everything from "_S" onward
+fact_sampleNames_trimmed$sample_ID <- str_remove(
+  fact$sample_ID,
+  "_S.*"
+)
+
+fact_cleaned <- fact_sampleNames_trimmed 
+```
+
+## SPLIT TAXONOMY COLUMN
+```{r}
+# Libraries
+ASV_data_with_taxonomy_split <- ASV_cleaned %>%
+  
+  # 1) Remove everything inside parentheses, including the parentheses
+  mutate(
+    Taxonomy_clean = str_remove_all(Taxonomy, "\\([^)]*\\)")
+  ) %>%
+  
+  # 2) Split the cleaned taxonomy column into 7 new columns
+  separate(
+    Taxonomy_clean,
+    into = c("Domain", "Phylum", "Class", "Order",
+             "Family", "Genus", "Species"),
+    sep = ";",
+    remove = FALSE   # keeps the cleaned taxonomy column
+  ) %>%
+  
+  # 3) Remove any extra spaces that might remain
+  mutate(
+    across(c(Domain, Phylum, Class, Order, Family, Genus, Species),
+           str_trim)
+  )
+
+ASV_abundance_table <- ASV_data_with_taxonomy_split %>%
+  dplyr::select(
+    -Domain, -Phylum, -Class, -Order,
+    -Family, -Genus, -Species,
+    -Taxonomy, -Taxonomy_clean
+  )
+ASV_taxonomy_table <- ASV_data_with_taxonomy_split %>%
+  dplyr::select(ASV_ID,
+    Domain, Phylum, Class, Order,
+    Family, Genus, Species
+  )
+```
+
+## ONLY KEEP DELISEA ULVA AND HORMOSIRA samples
+```{r}
+ASV_abundance_macroalgae_only <- ASV_abundance_table %>%
+  dplyr::select(
+    ASV_ID,
+    matches("^(U|DA|DS|D|HA|HE|H|NSW)")
+  )
+
+```
+
+```{r}
+asv_samples <- colnames(ASV_abundance_macroalgae_only)[-1]
+metadata_samples <- fact_cleaned$sample_ID
+
+# 1 Perfect match (same order)
+identical(asv_samples, metadata_samples)
+
+# 2 Same samples (ignore order)
+setequal(asv_samples, metadata_samples)
+
+# 3 Duplicates
+asv_samples[duplicated(asv_samples)]
+metadata_samples[duplicated(metadata_samples)]
+
+# 4 Differences
+setdiff(asv_samples, metadata_samples)
+setdiff(metadata_samples, asv_samples)
+```
+## ADD MISSING SAMPLES IN FACTOR TABLE
+```{r}
+asv_samples <- colnames(ASV_abundance_macroalgae_only)[-1]
+missing_samples <- setdiff(asv_samples, fact_cleaned$sample_ID)
+
+# 2) Build metadata for missing samples
+fact_new_samples <- tibble(sample_ID = missing_samples) %>%
+  mutate(
+    # stage rules
+    stage = case_when(
+      str_detect(sample_ID, "^DA")  ~ "adult",
+      str_detect(sample_ID, "^DS")  ~ "tetraspores",
+      str_detect(sample_ID, "^HA")  ~ "adult",
+      str_detect(sample_ID, "^HE")  ~ "eggs",
+      str_detect(sample_ID, "^NSWT") ~ "Seawater_24",
+      str_detect(sample_ID, "^NSW")  ~ "Seawater_24",
+      str_detect(sample_ID, "^N")    ~ "Seawater_24",
+      TRUE ~ NA_character_
+    ),
+
+    replicate = str_extract(sample_ID, "\\d+") %>% as.integer(),
+
+    sample_type = case_when(
+      str_detect(sample_ID, "^D")    ~ "D.pulchra",
+      str_detect(sample_ID, "^H")    ~ "H.banksii",
+      str_detect(sample_ID, "^NSWT") ~ "Seawater",
+      str_detect(sample_ID, "^NSW")  ~ "Seawater",
+      str_detect(sample_ID, "^N")    ~ "Seawater",
+      TRUE ~ NA_character_
+    ),
+    seaweed = case_when(
+  substr(stringr::str_squish(as.character(sample_ID)), 1, 1) == "D" ~ "D.pulchra",
+  substr(stringr::str_squish(as.character(sample_ID)), 1, 1) == "H" ~ "H.banksii",
+  substr(stringr::str_squish(as.character(sample_ID)), 1, 1) %in% c("U","S") ~ "U.australis",
+  TRUE ~ NA_character_
+),
+
+    treatment = "adult_spore",
+
+    # Study rule
+    study = case_when(
+      str_detect(sample_ID, "^NSWT") ~ "first",
+      str_detect(sample_ID, "^N")    ~ "second",
+      TRUE                           ~ "first"
+    )
+  ) %>%
+  mutate(
+    # Add _24 only to first study samples
+    sample_type = if_else(study == "first",
+                          paste0(sample_type, "_24"),
+                          sample_type),
+
+    sample_type_stage = paste(sample_type, stage, sep = "_")
+  ) %>%
+  # ---- Explicit override for H24H_2 ----
+  mutate(
+    stage = if_else(sample_ID == "H24H_2", "Stage_I", stage),
+    replicate = if_else(sample_ID == "H24H_2", 2L, replicate),
+    sample_type = if_else(sample_ID == "H24H_2", "H.banksii", sample_type),
+    treatment = if_else(sample_ID == "H24H_2", "H24H_2", treatment),
+    study = if_else(sample_ID == "H24H_2", "second", study),
+    sample_type_stage = if_else(sample_ID == "H24H_2",
+                                "H.banksii_Stage_I",
+                                sample_type_stage)
+  )
+
+# 3) Modify existing metadata (fact_cleaned)
+fact_existing_modified <- fact_cleaned %>%
+  mutate(
+    study = case_when(
+      str_detect(sample_ID, "^NSWT") ~ "first",
+      str_detect(sample_ID, "^N")    ~ "second",
+      TRUE                           ~ "second"
+    ),
+    sample_type = if_else(study == "first",
+                          paste0(sample_type, "_24"),
+                          sample_type),
+
+    # assign seaweed using first character of sample_ID
+    seaweed = case_when(
+      substr(sample_ID, 1, 1) == "D" ~ "D.pulchra",
+      substr(sample_ID, 1, 1) == "H" ~ "H.banksii",
+      substr(sample_ID, 1, 1) %in% c("U", "N") ~ "U.australis",
+      TRUE ~ NA_character_
+    )
+  )
+
+# 4) Bind everything
+fact_cleaned_with_new_samples <- bind_rows(
+  fact_existing_modified,
+  fact_new_samples
+)
+samples_to_remove <- c("HE_5", "NSWT_5", "H24H_1", "H24H_2", "NSWT_1","NSWT_2","NSWT_3","NSWT_4")
+
+# 1) Remove from ASV table (remove columns)
+ASV_abundance_macroalgae_only_filtered <- 
+  ASV_abundance_macroalgae_only %>%
+  dplyr::select(-any_of(samples_to_remove))
+
+# 2) Remove from metadata table (remove rows)
+fact_cleaned_filtered <- 
+  fact_cleaned_with_new_samples %>%
+  dplyr::filter(!sample_ID %in% samples_to_remove)
+
+# Optional: check
+setdiff(colnames(ASV_abundance_macroalgae_only_filtered)[-1],
+        fact_cleaned_filtered$sample_ID)
+
+# Save updated files if needed
+# write.csv(ASV_abundance_macroalgae_only_filtered,
+#           "outputs/files/ASV_abundance_filtered.csv",
+#           row.names = FALSE)
+# 
+# write.csv(fact_cleaned_filtered,
+#           "outputs/files/metadata_filtered.csv",
+#           row.names = FALSE)
+
+```
+
+```{r}
+fact_cleaned_filtered <- fact_cleaned_filtered %>%
+  column_to_rownames(var = "sample_ID")
+
+# Extract ASV sample order
+asv_samples <- colnames(ASV_abundance_macroalgae_only_filtered)[-1]
+
+# Reorder metadata to match that order
+fact_reordered <- fact_cleaned_filtered[asv_samples, , drop = FALSE]
+
+# Check
+identical(
+  colnames(ASV_abundance_macroalgae_only_filtered)[-1],
+  rownames(fact_reordered)
+)
+
+```
+
+```{r}
+# ===============================
+# CLEAN + FILTER + SAVE RAREFACTION
+# ===============================
+# 1 Build abundance matrix
+# -------------------------------
+asv_abund_mat <- ASV_abundance_macroalgae_only_filtered %>%
+  column_to_rownames("ASV_ID") %>%
+  as.matrix()
+
+asv_tax <- ASV_taxonomy_table %>%
+  dplyr::select(ASV_ID, Domain)
+
+# -------------------------------
+# 2 Remove unassigned Domain
+# -------------------------------
+unassigned_ids <- asv_tax %>%
+  mutate(Domain = str_trim(Domain)) %>%
+  filter(
+    is.na(Domain) | Domain == "" |
+      str_detect(str_to_lower(Domain),
+                 "Unassigned|Unclassified|Unknown|Uncultured|NA")
+  ) %>%
+  pull(ASV_ID)
+
+asv_abund_noUnassigned <- asv_abund_mat[
+  !(rownames(asv_abund_mat) %in% unassigned_ids),
+  , drop = FALSE
+]
+
+asv_tax_noUnassigned <- ASV_taxonomy_table %>%
+  filter(!(ASV_ID %in% unassigned_ids))
+
+# -------------------------------
+# 3 Remove all-zero ASVs
+# -------------------------------
+asv_totals <- rowSums(asv_abund_noUnassigned)
+
+asv_abund_noZero <- asv_abund_noUnassigned[asv_totals > 0, , drop = FALSE]
+asv_tax_noZero <- asv_tax_noUnassigned %>%
+  filter(ASV_ID %in% rownames(asv_abund_noZero))
+
+# -------------------------------
+# 4 Remove singletons (total count == 1)
+# -------------------------------
+asv_totals_noZero <- rowSums(asv_abund_noZero)
+
+asv_abund_final_clean <- asv_abund_noZero[asv_totals_noZero > 1, , drop = FALSE]
+asv_tax_final_clean <- asv_tax_noZero %>%
+  filter(ASV_ID %in% rownames(asv_abund_final_clean))
+
+# -------------------------------
+# 4b Filter ASVs present in < 2 samples within sample_type_stage
+# -------------------------------
+grp_stage <- as.factor(fact_reordered$sample_type_stage)
+names(grp_stage) <- rownames(fact_reordered)
+
+stopifnot(identical(colnames(asv_abund_final_clean), names(grp_stage)))
+
+prev_by_group <- sapply(levels(grp_stage), function(g) {
+  cols <- names(grp_stage)[grp_stage == g]
+  rowSums(asv_abund_final_clean[, cols, drop = FALSE] > 0)
+})
+
+prev_max <- if (is.null(dim(prev_by_group))) prev_by_group else apply(prev_by_group, 1, max)
+
+asv_abund_final_clean <- asv_abund_final_clean[prev_max >= 2, , drop = FALSE]
+asv_tax_final_clean <- asv_tax_final_clean %>%
+  filter(ASV_ID %in% rownames(asv_abund_final_clean))
+
+# -------------------------------
+# 5 Save rarefaction plot
+# -------------------------------
+
+# Transpose for vegan (samples in rows)
+sample_by_asv_mat <- t(asv_abund_final_clean)
+
+# Choose grouping variable (change if needed)
+grp <- as.factor(fact_reordered$sample_type)
+names(grp) <- rownames(fact_reordered)
+
+# Ensure alignment
+stopifnot(identical(colnames(asv_abund_final_clean),
+                    rownames(fact_reordered)))
+
+cols <- as.integer(grp[colnames(asv_abund_final_clean)])
+
+# Save plot to file
+#pdf("outputs/figures/Rarefaction_curve_cleaned.pdf", width = 8, height = 6)
+
+# rarecurve(sample_by_asv_mat,
+#           step = max(1, floor(min(rowSums(sample_by_asv_mat)) / 50)),
+#           label = FALSE,
+#           col = cols,
+#           xlab = "Sequencing depth (reads)",
+#           ylab = "Observed ASVs",
+#           main = "Rarefaction curves (cleaned dataset)")
+# 
+# legend("topright",
+#        legend = levels(grp),
+#        col = seq_along(levels(grp)),
+#        lty = 1, cex = 0.8, bty = "n")
+# 
+# dev.off()
+
+# -------------------------------
+# Final clean objects:
+# -------------------------------
+# asv_abund_final_clean   (matrix, no unassigned, no zeros, no singletons)
+# asv_tax_final_clean     (taxonomy aligned to filtered ASVs)
+
+```
+
+```{r}
+# -------------------------------
+# Save rarefaction plot (study == "second")
+# -------------------------------
+
+# Subset metadata for study == "second"
+fact_second <- fact_reordered %>%
+  dplyr::filter(study == "second")
+
+# Subset abundance matrix to matching samples
+asv_abund_second <- asv_abund_final_clean[ ,
+  colnames(asv_abund_final_clean) %in% rownames(fact_second),
+  drop = FALSE
+]
+
+# Ensure order matches metadata
+asv_abund_second <- asv_abund_second[ ,
+  rownames(fact_second),
+  drop = FALSE
+]
+
+# Transpose for vegan (samples in rows)
+sample_by_asv_mat <- t(asv_abund_second)
+
+# Grouping variable
+grp <- as.factor(fact_second$sample_type)
+names(grp) <- rownames(fact_second)
+
+# Colours
+cols <- as.integer(grp[rownames(sample_by_asv_mat)])
+
+# Save plot
+pdf("outputs/figures/Rarefaction_curve_cleaned_study_second.pdf",
+    width = 8, height = 6)
+max_depth <- min(10000, min(rowSums(sample_by_asv_mat)))
+
+# Strong distinct colours
+n_groups <- length(levels(grp))
+if (n_groups <= 9) {
+  palette_cols <- brewer.pal(n_groups, "Set1")
+} else {
+  palette_cols <- colorRampPalette(brewer.pal(9, "Set1"))(n_groups)
+}
+
+cols <- palette_cols[grp]
+
+rarecurve(sample_by_asv_mat,
+          step = 500,
+          sample = max_depth,
+          label = TRUE,      # show sample names
+          cex = 0.5,         # smaller text size
+          col = cols,
+          xlab = "Sequencing depth (reads)",
+          ylab = "Observed ASVs",
+          main = "")
+
+legend("topright",
+       legend = levels(grp),
+       col = palette_cols,
+       lty = 1,
+       cex = 0.8,
+       bty = "n")
+
+dev.off()
+
+```
+```{r}
+# -------------------------------
+# Total counts per sample (study == "second"), coloured by sample_type
+# -------------------------------
+# fact_second (metadata filtered to study == "second")
+# sample_by_asv_mat (samples in rows, ASVs in columns)
+
+counts_df <- tibble(
+  sample_ID   = rownames(sample_by_asv_mat),
+  total_reads = rowSums(sample_by_asv_mat)
+) %>%
+  left_join(
+    fact_second %>% tibble::rownames_to_column("sample_ID"),
+    by = "sample_ID"
+  ) %>%
+  mutate(sample_type = as.factor(sample_type))
+
+# Distinct colours for sample types
+n_groups <- nlevels(counts_df$sample_type)
+pal <- if (n_groups <= 9) brewer.pal(n_groups, "Set1") else colorRampPalette(brewer.pal(9, "Set1"))(n_groups)
+
+p_counts <- ggplot(counts_df, aes(x = sample_ID, y = total_reads, fill = sample_type)) +
+  geom_col() +
+  scale_fill_manual(values = pal) +
+  labs(
+    x = "Sample",
+    y = "Total counts (reads)",
+    fill = "Sample type",
+    title = "Total read counts per sample (study: stages)"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 6)
+  )
+
+#ggsave("outputs/figures/Total_counts_per_sample_study_second.pdf", p_counts, width = 10, height = 5)
+p_counts
+
+```
+
+```{r}
+# ===============================
+# GENUS TAXA PLOTS (CLEAN DATASET; study = all)
+# - Removes Unclassified at Domain level
+# - Genus-level relative abundance
+# - Keeps ONLY TOP 25 genera globally (by mean RelAb across all samples)
+#   everything else -> "Others"
+# - Facet by stage
+# - 3 plots: (U.australis + Seawater), (H.banksii), (D.pulchra)
+# - VERY distinct, ISME-friendly colours
+# - SAME genus keeps SAME colour across all plots
+# - Genus labels italic in legend (Others not italic)
+# ===============================
+# 0) Safety checks
+# -------------------------------
+stopifnot(identical(colnames(asv_abund_final_clean), rownames(fact_reordered)))
+stopifnot(all(rownames(asv_abund_final_clean) %in% asv_tax_final_clean$ASV_ID))
+
+# remove duplicated ASV taxonomy rows if any
+asv_tax_final_clean <- asv_tax_final_clean %>%
+  distinct(ASV_ID, .keep_all = TRUE)
+
+# -------------------------------
+# 1) Remove "Unclassified/Unassigned/Unknown/..." at Domain level
+#    and match abundance table to remaining ASVs
+# -------------------------------
+asv_tax_final_clean2 <- asv_tax_final_clean %>%
+  mutate(Domain = str_trim(Domain)) %>%
+  filter(
+    !is.na(Domain),
+    Domain != "",
+    !str_detect(str_to_lower(Domain),
+                "Unassigned|Unclassified|Unknown|Uncultured|NA")
+  )
+
+asv_abund_final_clean2 <- asv_abund_final_clean[
+  rownames(asv_abund_final_clean) %in% asv_tax_final_clean2$ASV_ID,
+  , drop = FALSE
+]
+
+# -------------------------------
+# 2 Metadata selection
+# -------------------------------
+fact_second <- fact_reordered
+
+asv_abund_second <- asv_abund_final_clean2[, rownames(fact_second), drop = FALSE]
+
+# -------------------------------
+# 3 Long format table
+# -------------------------------
+abund_long <- as.data.frame(asv_abund_second) %>%
+  rownames_to_column("ASV_ID") %>%
+  pivot_longer(-ASV_ID, names_to = "Sample", values_to = "Count") %>%
+  left_join(asv_tax_final_clean2 %>% dplyr::select(ASV_ID, Genus), by = "ASV_ID") %>%
+  left_join(fact_second %>% rownames_to_column("Sample"), by = "Sample") %>%
+ mutate(
+  Genus = ifelse(is.na(Genus) | Genus == "", "Unclassified_genus", Genus),
+  stage = factor(
+    stage,
+    levels = c("adult", "tetraspores", "eggs", "Stage_I", "Stage_II", "Stage_III", "Stage_IV", "Stage_V", "Seawater_I/II", "Seawater_III/IV")
+  )
+)
+
+# -------------------------------
+# 4 Relative abundance by genus
+# -------------------------------
+genus_df <- abund_long %>%
+  group_by(Sample, sample_type, stage, Genus) %>%
+  summarise(Count = sum(Count), .groups = "drop") %>%
+  group_by(Sample) %>%
+  mutate(RelAb = Count / sum(Count)) %>%
+  ungroup()
+
+# -------------------------------
+# Helpers
+# -------------------------------
+make_italic_labels <- function(levels_vec) {
+  lapply(levels_vec, function(g) {
+    if (g == "Others") "Others"
+    else as.expression(bquote(italic(.(g))))
+  })
+}
+
+# Top 25 within a subset of sample_types
+get_top25_subset <- function(df, sample_types, topN = 25) {
+  df %>%
+    filter(sample_type %in% sample_types) %>%
+    group_by(Genus) %>%
+    summarise(mean_ab = mean(RelAb), .groups = "drop") %>%
+    arrange(desc(mean_ab)) %>%
+    slice_head(n = topN) %>%
+    pull(Genus)
+}
+
+base_colors <- c(
+  "#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7",
+  "#56B4E9", "#F0E442", "#000000", "#332288", "#AA4499",
+  "#88CCEE", "#44AA99", "#117733", "#999933", "#DDCC77",
+  "#CC6677", "#882255", "#661100", "#6699CC", "#BBBBBB",
+  "#2E4057", "#1B998B", "#E84855", "#F6AE2D", "#6C5B7B"
+)
+
+# compute Top 25 genera for each subset (same logic as your plotting function)
+top_UA_SW <- get_top25_subset(genus_df, c("U.australis_26", "Seawater_26"), topN = 25)
+top_HB    <- get_top25_subset(genus_df, c("H.banksii_24", "H.banksii_26"), topN = 25)
+top_DP    <- get_top25_subset(genus_df, c("D.pulchra_24", "D.pulchra_26"), topN = 25)
+
+# union in an order that preserves existing UA+SW colours
+all_top_genera <- unique(c(top_UA_SW, top_HB, top_DP))
+
+# Extend colours only if needed (CVD-safe pool; very distinct)
+if (length(all_top_genera) > length(base_colors)) {
+
+ cvd_safe_pool <- c(
+  # Okabe–Ito / Tol-style extensions (CVD-safe)
+  "#0072B2","#E69F00","#009E73","#D55E00","#CC79A7",
+  "#56B4E9","#F0E442","#000000","#332288","#AA4499",
+  "#88CCEE","#44AA99","#117733","#999933","#DDCC77",
+  "#CC6677","#882255","#661100","#6699CC","#BBBBBB",
+  "#264653","#2A9D8F","#E76F51","#E9C46A","#6D597A",
+  "#3A86FF","#8338EC","#FF006E","#FB5607","#FFBE0B",
+  "#4D908E","#577590","#43AA8B","#F94144","#277DA1",
+
+  # ---- additional CVD-safe colours ----
+  "#1B9E77",  # teal-green
+  "#D95F02",  # burnt orange
+  "#7570B3",  # violet
+  "#E7298A",  # magenta
+  "#66A61E",  # olive green
+  "#E6AB02",  # mustard
+  "#A6761D",  # brown
+  "#666666",  # dark grey
+  "#1F78B4",  # strong blue
+  "#B2DF8A"   # light green
+)
+
+  # take only colours not already used
+  cvd_safe_pool <- setdiff(cvd_safe_pool, base_colors)
+
+  extra_n <- length(all_top_genera) - length(base_colors)
+
+  #if (extra_n > length(cvd_safe_pool)) {
+  #  stop("Need more CVD-safe colours than available in the pool. Increase the pool or reduce categories.")
+ # }
+
+  base_colors <- c(base_colors, cvd_safe_pool[1:extra_n])
+}
+# named global palette: genus -> colour
+global_genus_palette <- setNames(base_colors[seq_along(all_top_genera)], all_top_genera)
+
+# -------------------------------
+# Plot function (Top 25 PER subset)
+# -------------------------------
+make_taxaplot_stagefacet_top25_subset <- function(df, sample_types, outfile, topN = 25) {
+
+  # compute Top 25 for THIS subset only
+  top_genera <- get_top25_subset(df, sample_types, topN = topN)
+
+  sub <- df %>%
+    filter(sample_type %in% sample_types) %>%
+    mutate(Genus = ifelse(Genus %in% top_genera, Genus, "Others")) %>%
+    group_by(Sample, sample_type, stage, Genus) %>%
+    summarise(RelAb = sum(RelAb), .groups = "drop")
+
+  # legend order
+  legend_levels <- c(top_genera, "Others")
+  sub$Genus <- factor(sub$Genus, levels = legend_levels)
+
+  # italic legend labels
+  labels_leg <- make_italic_labels(legend_levels)
+  names(labels_leg) <- legend_levels
+
+  # --- per-plot palette (NOT consistent across plots; uses CVD-safe base_colors) ---
+  palette_subset <- setNames(base_colors[seq_along(top_genera)], top_genera)
+  palette_subset["Others"] <- "grey80"
+
+  p <- ggplot(sub, aes(x = Sample, y = RelAb, fill = Genus)) +
+    geom_col(width = 0.95, colour = "white", size = 0.15) +
+    facet_wrap(~stage, scales = "free_x", ncol = 7) +
+    scale_y_continuous(labels = percent_format()) +
+    scale_fill_manual(
+      values = palette_subset,          # <-- changed
+      breaks = legend_levels,
+      labels = labels_leg,
+      drop = TRUE
+    ) +
+    guides(fill = guide_legend(ncol = 6)) +
+    labs(x = NULL, y = "Relative abundance") +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      axis.text.x = element_text(angle = 90, hjust = 1, size = 7),
+      legend.title = element_blank(),
+      strip.text = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+
+  # ggsave(outfile, p, width = 11, height = 5.5)
+  # return(p)
+}
+# -------------------------------
+# 5 Generate plots (Top 25 per group)
+# -------------------------------
+
+p_genus_UA_SW <- make_taxaplot_stagefacet_top25_subset(
+  genus_df,
+  sample_types = c("U.australis_26", "Seawater_26"),
+  outfile = "outputs/figures/taxaplot_genus_Uaustralis_seawater_top25_per_subset.pdf",
+  topN = 25
+)
+
+p_genus_HB <- make_taxaplot_stagefacet_top25_subset(
+  genus_df,
+  sample_types = c("H.banksii_24", "H.banksii_26"),
+  outfile = "outputs/figures/taxaplot_genus_Hbanksii_top25_per_subset.pdf",
+  topN = 25
+)
+
+p_genus_DP <- make_taxaplot_stagefacet_top25_subset(
+  genus_df,
+  sample_types = c("D.pulchra_24", "D.pulchra_26"),
+  outfile = "outputs/figures/taxaplot_genus_Dpulchra_top25_per_subset.pdf",
+  topN = 25
+)
+
+p_genus_UA_SW
+p_genus_HB
+p_genus_DP
+
+#Check that rel abundance was calculated corrrecly:
+genus_df %>%
+  group_by(Sample) %>%
+  summarise(total = sum(RelAb))
+```
+
+## Use of Atchinson - PCOA and Sorensen (P/A) PCOA
+```{r}
+# 1️⃣ Subset metadata (study = second)
+# ----------------------------------
+metadata_second <- fact_reordered %>%
+  as.data.frame() %>%
+  rownames_to_column("sample_ID") %>%
+  filter(study == "second")
+
+samples_second <- metadata_second$sample_ID
+
+# ----------------------------------
+# 2️⃣ Subset RAW count matrix
+# ----------------------------------
+asv_raw_second <- asv_abund_final_clean[, samples_second, drop = FALSE]
+
+# ----------------------------------
+# 3️⃣ Add pseudocount + CLR transform
+# ----------------------------------
+asv_clr_second <- t(apply(asv_raw_second + 1, 2, function(x) {
+  log(x) - mean(log(x))
+}))
+
+# ----------------------------------
+# 4️⃣ Aitchison distance + PCoA
+# ----------------------------------
+aitchison_dist_second <- dist(asv_clr_second, method = "euclidean")
+
+pcoa_second <- cmdscale(aitchison_dist_second,
+                        eig = TRUE,
+                        k = 2)
+
+pcoa_scores_second <- as.data.frame(pcoa_second$points)
+colnames(pcoa_scores_second) <- c("PCoA1", "PCoA2")
+pcoa_scores_second$sample_ID <- rownames(pcoa_scores_second)
+
+# ----------------------------------
+# 5️⃣ Merge metadata
+# ----------------------------------
+pcoa_plot_df_second <- pcoa_scores_second %>%
+  left_join(metadata_second, by = "sample_ID") %>%
+  mutate(
+    stage = factor(stage),
+    sample_type = factor(sample_type)
+  )
+
+# ----------------------------------
+# 6️⃣ SAME colour & shape settings as NMDS
+# ----------------------------------
+
+# Same stage colour logic (Set1)
+stage_levels <- levels(pcoa_plot_df_second$stage)
+stage_colors <- brewer.pal(max(3, length(stage_levels)), "Set1")[1:length(stage_levels)]
+
+# Same manual shapes
+sample_type_levels <- levels(pcoa_plot_df_second$sample_type)
+manual_shapes <- c(16, 17, 15, 18, 3, 7, 8, 0, 1, 2)
+shape_map <- setNames(manual_shapes[seq_along(sample_type_levels)],
+                      sample_type_levels)
+
+# ----------------------------------
+# 7️⃣ Variance explained
+# ----------------------------------
+eig_vals <- pcoa_second$eig
+var_explained <- round(100 * eig_vals / sum(eig_vals), 2)
+
+# ----------------------------------
+# 8️⃣ Plot
+# ----------------------------------
+PCOA_Atchinson_second <- ggplot(pcoa_plot_df_second,
+       aes(x = PCoA1, y = PCoA2,
+           color = stage,
+           shape = sample_type)) +
+  geom_point(size = 4, alpha = 0.9) +
+  scale_color_manual(values = stage_colors) +
+  scale_shape_manual(values = shape_map) +
+  theme_classic(base_size = 15) +
+  labs(title = "PCoA (Aitchison) – Study: Second",
+       x = paste0("PCoA1 (", var_explained[1], "%)"),
+       y = paste0("PCoA2 (", var_explained[2], "%)"),
+       color = "Stage",
+       shape = "Sample Type") +
+  theme(plot.title = element_text(face = "bold"))
+
+#ggsave(plot = PCOA_Atchinson_second, "outputs/figures/PCOA_Atchinson_second.pdf", width = 8, height = 8)
+```
+
+## STATS - PERMANOVA AND PERMDISP on SORENSEN and ATCHINSON
+```{r}
+# =========================
+# STATS (study == "second" and "first") | ALL STAGES
+#
+# PART 1:
+#   all sample_types together
+#   -> PERMDISP + PERMANOVA + pairwise PERMANOVA
+#
+# PART 2:
+#   within each sample_type
+#   -> test stage effect with PERMDISP + PERMANOVA + pairwise PERMANOVA
+#
+# Distances:
+#   - Aitchison
+#   - Sorensen
+#
+# Pairwise p-values:
+#   - BH correction
+# =========================
+fact_reordered$sample_ID <- rownames(fact_reordered)
+
+# --------------------------------------------------
+# 1) Metadata
+# --------------------------------------------------
+meta_all <- fact_reordered %>%
+  filter(study %in% c("second", "first")) %>%
+  mutate(
+    sample_type = droplevels(factor(as.character(sample_type))),
+    stage       = droplevels(factor(as.character(stage)))
+  ) %>%
+  dplyr::select(sample_ID, study, sample_type, stage)
+
+# Check sample IDs are unique
+if (anyDuplicated(meta_all$sample_ID)) {
+  stop("Duplicated sample_IDs in meta_all: ",
+       paste(meta_all$sample_ID[duplicated(meta_all$sample_ID)], collapse = ", "))
+}
+
+# --------------------------------------------------
+# 2) Match ASV table to metadata
+# --------------------------------------------------
+keep_ids <- meta_all$sample_ID
+
+missing_cols <- setdiff(keep_ids, colnames(asv_abund_final_clean))
+if (length(missing_cols) > 0) {
+  stop("These sample_IDs are in metadata but not in ASV table colnames: ",
+       paste(missing_cols, collapse = ", "))
+}
+
+asv_abund_all <- asv_abund_final_clean[, keep_ids, drop = FALSE]
+
+# Transpose: rows = samples, cols = ASVs
+sample_by_asv_mat_all <- t(asv_abund_all)
+
+# Make sure sample order matches metadata exactly
+stopifnot(identical(rownames(sample_by_asv_mat_all), meta_all$sample_ID))
+
+# --------------------------------------------------
+# 3) Helper: create one standard result row
+# --------------------------------------------------
+make_result_row <- function(
+  analysis, species, method, test, term,
+  contrast = NA_character_,
+  df = NA_real_, F_value = NA_real_, R2 = NA_real_, p_value = NA_real_,
+  assumption_ok = NA, p_adj = NA_real_
+) {
+  tibble(
+    analysis = analysis,
+    species = species,
+    method = method,
+    test = test,
+    term = term,
+    contrast = contrast,
+    df = df,
+    F_value = F_value,
+    R2 = R2,
+    p_value = p_value,
+    assumption_ok = assumption_ok,
+    p_adj = p_adj
+  )
+}
+
+# --------------------------------------------------
+# 4) Helper: extract values from adonis2 output
+# --------------------------------------------------
+extract_adonis_row <- function(ad) {
+  tab <- as.data.frame(ad)
+
+  # Keep only model terms, remove bookkeeping rows
+  tab <- tab[!(rownames(tab) %in% c("Residual", "Total")), , drop = FALSE]
+
+  if (nrow(tab) == 0) {
+    return(list(
+      df = NA_real_,
+      F_value = NA_real_,
+      R2 = NA_real_,
+      p_value = NA_real_
+    ))
+  }
+
+  cn <- colnames(tab)
+
+  df_col <- cn[grepl("^Df$", cn)]
+  f_col  <- cn[grepl("^F$|F.Model|^F value$|^F_value$", cn)]
+  r2_col <- cn[grepl("^R2$", cn)]
+  p_col  <- cn[grepl("Pr\\(>F\\)|p.value|p_value", cn)]
+
+  list(
+    df = if (length(df_col) > 0) as.numeric(tab[[df_col[1]]][1]) else NA_real_,
+    F_value = if (length(f_col) > 0) as.numeric(tab[[f_col[1]]][1]) else NA_real_,
+    R2 = if (length(r2_col) > 0) as.numeric(tab[[r2_col[1]]][1]) else NA_real_,
+    p_value = if (length(p_col) > 0) as.numeric(tab[[p_col[1]]][1]) else NA_real_
+  )
+}
+
+# --------------------------------------------------
+# 5) Helper: extract values from PERMDISP output
+# --------------------------------------------------
+extract_permdisp_row <- function(pd) {
+  tab <- as.data.frame(pd$tab)
+
+  if (nrow(tab) == 0) {
+    return(list(
+      df = NA_real_,
+      F_value = NA_real_,
+      p_value = NA_real_
+    ))
+  }
+
+  cn <- colnames(tab)
+
+  df_col <- cn[grepl("^Df$", cn)]
+  f_col  <- cn[grepl("^F$|F.Model|^F value$|^F_value$", cn)]
+  p_col  <- cn[grepl("Pr\\(>F\\)|p.value|p_value", cn)]
+
+  list(
+    df = if (length(df_col) > 0) as.numeric(tab[[df_col[1]]][1]) else NA_real_,
+    F_value = if (length(f_col) > 0) as.numeric(tab[[f_col[1]]][1]) else NA_real_,
+    p_value = if (length(p_col) > 0) as.numeric(tab[[p_col[1]]][1]) else NA_real_
+  )
+}
+
+# --------------------------------------------------
+# 6) Helper: compute distance matrices
+# --------------------------------------------------
+compute_dists <- function(asv_mat) {
+  # Remove ASVs absent in all retained samples
+  asv_mat <- asv_mat[, colSums(asv_mat) > 0, drop = FALSE]
+
+  if (ncol(asv_mat) == 0) {
+    return(NULL)
+  }
+
+  # Aitchison distance: CLR transform with pseudocount 1
+  log_mat <- log(asv_mat + 1)
+  clr <- sweep(log_mat, 1, rowMeans(log_mat), "-")
+  dist_ait <- dist(clr)
+
+  # Sorensen distance: binary Bray-Curtis
+  dist_sor <- vegdist(asv_mat, method = "bray", binary = TRUE)
+
+  list(
+    Aitchison = dist_ait,
+    Sorensen = dist_sor
+  )
+}
+
+# --------------------------------------------------
+# 7) Helper: pairwise PERMANOVA for one grouping variable
+# --------------------------------------------------
+pairwise_adonis1 <- function(d, g, permutations = 999, p_adjust = "BH") {
+  g <- droplevels(factor(g))
+  lvls <- levels(g)
+
+  if (length(lvls) < 2) return(NULL)
+
+  dmat <- as.matrix(d)
+  out_list <- list()
+  k <- 1
+
+  for (i in 1:(length(lvls) - 1)) {
+    for (j in (i + 1):length(lvls)) {
+
+      li <- lvls[i]
+      lj <- lvls[j]
+
+      idx <- which(g %in% c(li, lj))
+      sub_g <- droplevels(g[idx])
+
+      # Need at least 2 samples in each group
+      if (sum(sub_g == li) < 2 || sum(sub_g == lj) < 2) next
+
+      sub_d <- as.dist(dmat[idx, idx, drop = FALSE])
+
+      ad <- tryCatch(
+        adonis2(sub_d ~ sub_g, permutations = permutations),
+        error = function(e) NULL
+      )
+
+      if (is.null(ad)) next
+
+      ad_row <- extract_adonis_row(ad)
+
+      out_list[[k]] <- tibble(
+        contrast = paste(li, "vs", lj),
+        df = ad_row$df,
+        F_value = ad_row$F_value,
+        R2 = ad_row$R2,
+        p_value = ad_row$p_value
+      )
+
+      k <- k + 1
+    }
+  }
+
+  out <- bind_rows(out_list)
+
+  if (nrow(out) == 0) return(NULL)
+
+  out %>%
+    mutate(p_adj = p.adjust(p_value, method = p_adjust))
+}
+
+# --------------------------------------------------
+# 8) Run analyses
+# --------------------------------------------------
+results <- list()
+
+# =========================
+# PART 1: ALL SAMPLES | sample_type
+# =========================
+asv_all <- sample_by_asv_mat_all[meta_all$sample_ID, , drop = FALSE]
+dists_all <- compute_dists(asv_all)
+
+if (is.null(dists_all)) {
+  stop("No ASVs remaining after filtering zero-sum columns.")
+}
+
+for (method in names(dists_all)) {
+
+  d <- dists_all[[method]]
+
+  # ---- PERMDISP ----
+  bd <- tryCatch(
+    betadisper(d, meta_all$sample_type),
+    error = function(e) NULL
+  )
+
+  if (!is.null(bd)) {
+    pd <- tryCatch(
+      permutest(bd, permutations = 999),
+      error = function(e) NULL
+    )
+
+    if (!is.null(pd)) {
+      pd_row <- extract_permdisp_row(pd)
+
+      results[[length(results) + 1]] <- make_result_row(
+        analysis = "ALL_SAMPLES",
+        species = "ALL",
+        method = method,
+        test = "PERMDISP",
+        term = "sample_type",
+        df = pd_row$df,
+        F_value = pd_row$F_value,
+        p_value = pd_row$p_value,
+        assumption_ok = ifelse(is.na(pd_row$p_value), NA, pd_row$p_value >= 0.05)
+      )
+    }
+  }
+
+  # ---- PERMANOVA ----
+  ad <- tryCatch(
+    adonis2(d ~ sample_type, data = meta_all, permutations = 999),
+    error = function(e) NULL
+  )
+
+  if (!is.null(ad)) {
+    ad_row <- extract_adonis_row(ad)
+
+    results[[length(results) + 1]] <- make_result_row(
+      analysis = "ALL_SAMPLES",
+      species = "ALL",
+      method = method,
+      test = "PERMANOVA",
+      term = "sample_type",
+      df = ad_row$df,
+      F_value = ad_row$F_value,
+      R2 = ad_row$R2,
+      p_value = ad_row$p_value
+    )
+  }
+
+  # ---- pairwise PERMANOVA ----
+  pw <- pairwise_adonis1(
+    d,
+    meta_all$sample_type,
+    permutations = 999,
+    p_adjust = "BH"
+  )
+
+  if (!is.null(pw)) {
+    results[[length(results) + 1]] <- pw %>%
+      transmute(
+        analysis = "ALL_SAMPLES",
+        species = "ALL",
+        method = method,
+        test = "PERMANOVA_pairwise",
+        term = "sample_type",
+        contrast = contrast,
+        df = df,
+        F_value = F_value,
+        R2 = R2,
+        p_value = p_value,
+        assumption_ok = NA,
+        p_adj = p_adj
+      )
+  }
+}
+
+# =========================
+# PART 2: WITHIN EACH sample_type | stage
+# =========================
+for (sp in levels(meta_all$sample_type)) {
+
+  meta_sp <- meta_all %>%
+    filter(sample_type == sp) %>%
+    mutate(stage = droplevels(stage))
+
+  # Need at least 2 stages and enough samples
+  if (nlevels(meta_sp$stage) < 2) next
+  if (nrow(meta_sp) < 3) next
+
+  asv_sp <- sample_by_asv_mat_all[meta_sp$sample_ID, , drop = FALSE]
+  dists_sp <- compute_dists(asv_sp)
+
+  if (is.null(dists_sp)) next
+
+  for (method in names(dists_sp)) {
+
+    d <- dists_sp[[method]]
+
+    # ---- PERMDISP ----
+    bd <- tryCatch(
+      betadisper(d, meta_sp$stage),
+      error = function(e) NULL
+    )
+
+    if (!is.null(bd)) {
+      pd <- tryCatch(
+        permutest(bd, permutations = 999),
+        error = function(e) NULL
+      )
+
+      if (!is.null(pd)) {
+        pd_row <- extract_permdisp_row(pd)
+
+        results[[length(results) + 1]] <- make_result_row(
+          analysis = "WITHIN_SAMPLE_TYPE",
+          species = sp,
+          method = method,
+          test = "PERMDISP",
+          term = "stage",
+          df = pd_row$df,
+          F_value = pd_row$F_value,
+          p_value = pd_row$p_value,
+          assumption_ok = ifelse(is.na(pd_row$p_value), NA, pd_row$p_value >= 0.05)
+        )
+      }
+    }
+
+    # ---- PERMANOVA ----
+    ad <- tryCatch(
+      adonis2(d ~ stage, data = meta_sp, permutations = 999),
+      error = function(e) NULL
+    )
+
+    if (!is.null(ad)) {
+      ad_row <- extract_adonis_row(ad)
+
+      results[[length(results) + 1]] <- make_result_row(
+        analysis = "WITHIN_SAMPLE_TYPE",
+        species = sp,
+        method = method,
+        test = "PERMANOVA",
+        term = "stage",
+        df = ad_row$df,
+        F_value = ad_row$F_value,
+        R2 = ad_row$R2,
+        p_value = ad_row$p_value
+      )
+    }
+
+    # ---- pairwise PERMANOVA ----
+    pw <- pairwise_adonis1(
+      d,
+      meta_sp$stage,
+      permutations = 999,
+      p_adjust = "BH"
+    )
+
+    if (!is.null(pw)) {
+      results[[length(results) + 1]] <- pw %>%
+        transmute(
+          analysis = "WITHIN_SAMPLE_TYPE",
+          species = sp,
+          method = method,
+          test = "PERMANOVA_pairwise",
+          term = "stage",
+          contrast = contrast,
+          df = df,
+          F_value = F_value,
+          R2 = R2,
+          p_value = p_value,
+          assumption_ok = NA,
+          p_adj = p_adj
+        )
+    }
+  }
+}
+
+# --------------------------------------------------
+# 9) Combine results
+# --------------------------------------------------
+stats_out <- bind_rows(results) %>%
+  arrange(analysis, species, method, test, term, contrast)
+
+print(stats_out, n = 200)
+
+# --------------------------------------------------
+# 10) Save results
+# --------------------------------------------------
+# --------------------------------------------------
+# Add significance stars
+# --------------------------------------------------
+stats_out <- stats_out %>%
+  mutate(
+    sig = case_when(
+      # Pairwise PERMANOVA (use adjusted p-values)
+      test == "PERMANOVA_pairwise" & !is.na(p_adj) & p_adj < 0.001 ~ "***",
+      test == "PERMANOVA_pairwise" & !is.na(p_adj) & p_adj < 0.01  ~ "**",
+      test == "PERMANOVA_pairwise" & !is.na(p_adj) & p_adj < 0.05  ~ "*",
+
+      # All other tests (use raw p-values)
+      test != "PERMANOVA_pairwise" & !is.na(p_value) & p_value < 0.001 ~ "***",
+      test != "PERMANOVA_pairwise" & !is.na(p_value) & p_value < 0.01  ~ "**",
+      test != "PERMANOVA_pairwise" & !is.na(p_value) & p_value < 0.05  ~ "*",
+
+      TRUE ~ ""
+    )
+  )
+
+#dir.create("outputs/files", showWarnings = FALSE, recursive = TRUE)
+
+# write.csv(
+#   stats_out,
+#   "outputs/files/Stats_first_and_second_ALLSTAGES_PART1allSampleTypes_PART2stageOnly.csv",
+#   row.names = FALSE
+#)
+
+# Keep only significant results
+stats_sig <- stats_out %>%
+  filter(
+    (test == "PERMANOVA_pairwise" & !is.na(p_adj) & p_adj < 0.05) |
+    (test != "PERMANOVA_pairwise" & !is.na(p_value) & p_value < 0.05)
+  )
+
+# write.csv(
+#   stats_sig,
+#   "outputs/files/Stats_first_and_second_ALLSTAGES_significant_only.csv",
+#   row.names = FALSE
+# )
+
+```
+
+## PLOT PCOA
+```{r}
+# =========================
+# PCoA (Aitchison + Sørensen) | FIRST + SECOND | ALL STAGES
+# 8 plots total:
+#   For EACH distance (Aitchison, Sørensen):
+#     1) D.pulchra + D.pulchra_24 + Seawater + Seawater_24
+#     2) U.australis + Seawater
+#     3) H.banksii + H.banksii_24 + Seawater + Seawater_24
+#     4) ALL samples
+#
+# Aesthetics:
+#   - shape  = sample_type
+#   - colour = stage
+# Style:
+#   - distinct colours (Okabe–Ito extended if needed)
+#   - larger points
+#   - Nature/ISME-ish theme
+#   - fixed axis limits within each distance (comparable across the 4 subsets)
+#   - NO ellipses
+#   - each plot saved as a separate PDF
+# =========================
+# fact_reordered (rownames are sample_ID; cols include study, sample_type, stage)
+# asv_abund_final_clean (ASVs x samples; colnames are sample_ID)
+
+fact_reordered$sample_ID <- rownames(fact_reordered)
+
+# -------------------------
+# Metadata (first + second)
+# -------------------------
+meta_all <- fact_reordered %>%
+  filter(study %in% c("first", "second")) %>%
+  transmute(
+    sample_ID,
+    study,
+    sample_type = droplevels(factor(as.character(sample_type))),
+    stage       = droplevels(factor(as.character(stage)))
+  )
+
+# -------------------------
+# Build ASV matrix (samples x ASVs) aligned to meta_all
+# -------------------------
+keep_ids <- meta_all$sample_ID
+asv_abund_all <- asv_abund_final_clean[, colnames(asv_abund_final_clean) %in% keep_ids, drop = FALSE]
+
+missing_cols <- setdiff(keep_ids, colnames(asv_abund_all))
+if (length(missing_cols) > 0) {
+  stop("These sample_IDs are in metadata but not in ASV table colnames: ",
+       paste(missing_cols, collapse = ", "))
+}
+
+asv_abund_all <- asv_abund_all[, keep_ids, drop = FALSE]
+sample_by_asv_mat_all <- t(asv_abund_all)  # samples x ASVs
+
+# -------------------------
+# Distances
+# -------------------------
+compute_dists <- function(asv_mat) {
+  asv_mat <- asv_mat[, colSums(asv_mat) > 0, drop = FALSE]
+
+  # Aitchison (CLR on counts + pseudocount 1)
+  clr <- sweep(log(asv_mat + 1), 1, rowMeans(log(asv_mat + 1)), "-")
+  dist_ait <- dist(clr)
+
+  # Sørensen (binary Bray-Curtis)
+  dist_sor <- vegdist(asv_mat, method = "bray", binary = TRUE)
+
+  list(Aitchison = dist_ait, Sorensen = dist_sor)
+}
+
+# -------------------------
+# PCoA df helper
+# -------------------------
+pcoa_df <- function(d, meta) {
+  ord <- cmdscale(d, k = 2, eig = TRUE)
+  pts <- as.data.frame(ord$points)
+  colnames(pts) <- c("PCoA1", "PCoA2")
+  pts$sample_ID <- rownames(pts)
+
+  eig <- ord$eig
+  pos <- eig[eig > 0]
+  var1 <- if (length(pos) >= 1) 100 * pos[1] / sum(pos) else NA_real_
+  var2 <- if (length(pos) >= 2) 100 * pos[2] / sum(pos) else NA_real_
+
+  out <- meta %>% inner_join(pts, by = "sample_ID")
+  attr(out, "var1") <- var1
+  attr(out, "var2") <- var2
+  out
+}
+
+# -------------------------
+# Theme (Nature/ISME-ish)
+# -------------------------
+theme_natureish <- function(base_size = 12) {
+  theme_classic(base_size = base_size) +
+    theme(
+      plot.title = element_text(face = "bold", size = base_size + 2, hjust = 0),
+      axis.title = element_text(size = base_size + 1),
+      axis.text  = element_text(color = "black"),
+      legend.title = element_text(face = "bold"),
+      legend.key = element_blank(),
+      legend.background = element_blank(),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4),
+      plot.margin = margin(7, 7, 7, 7)
+    )
+}
+
+# -------------------------
+# More distinct palette
+# -------------------------
+# okabe_ito <- c(
+#   "#D81B60",  # magenta
+#   "#1E88E5",  # blue
+#   "#43A047",  # green
+#   "#FFC107",  # amber
+#   "#6D4C41",  # brown
+#   "#8E24AA",  # purple
+#   "#004D40",  # deep teal
+#   "#D55E00",  # vermillion
+#   "#C0CA33",  # yellow-green
+#   "#3949AB",  # royal blue
+#   "#E53935",  # red
+#   "#7CB342",  # lime green
+#   "#5E35B1",  # indigo
+#   "#FB8C00",  # orange
+#   "#00897B",  # teal green
+#   "#F4511E",  # deep orange
+#   "#9C27B0",  # violet
+#   "#039BE5",   # bright blue
+#   "#546E7A",  # blue-grey
+#   "#00ACC1"  # cyan
+# )
+
+stage_cols <- c(
+  "adult"            = "#D81B60",
+"eggs"             = "#1E88E5",
+"tetraspores"      =   "#3949AB",
+"Seawater_I/II"    = "#D55E00",
+"Seawater_III/IV"  = "#C0CA33",
+"Stage_I"      = "#43A047",
+"Stage_II"    = "#FFC107",
+"Stage_III"  = "#6D4C41",
+"Stage_IV"          = "#8E24AA",
+"Stage_V"         = "#004D40"
+#,"XXX"        = "#D55E00",
+ # XXX"         = "#C0CA33",
+ # XXX"          = "#3949AB"
+)
+
+# shapes (enough distinct, publication friendly)
+shape_pool <- c(17, 15, 18, 13, 7, 8, 0, 1, 2, 5)
+
+# -------------------------
+# Subset helper (robust matching via tolower)
+# -------------------------
+subset_meta_by_types <- function(meta, types_keep) {
+  tk <- tolower(types_keep)
+  meta %>%
+    filter(tolower(as.character(sample_type)) %in% tk) %>%
+    mutate(
+      sample_type = droplevels(factor(as.character(sample_type))),
+      stage       = droplevels(factor(as.character(stage)))
+    )
+}
+
+# -------------------------
+# Axis limits helper (fixed within each distance across all subsets)
+# -------------------------
+get_global_limits <- function(df_list, pad_frac = 0.05) {
+  allx <- unlist(lapply(df_list, \(df) df$PCoA1))
+  ally <- unlist(lapply(df_list, \(df) df$PCoA2))
+  xr <- range(allx, finite = TRUE)
+  yr <- range(ally, finite = TRUE)
+  xpad <- diff(xr) * pad_frac
+  ypad <- diff(yr) * pad_frac
+  list(xlim = c(xr[1] - xpad, xr[2] + xpad),
+       ylim = c(yr[1] - ypad, yr[2] + ypad))
+}
+
+# -------------------------
+# Plot function: colour=stage, shape=sample_type (NO ellipses)
+# -------------------------
+plot_pcoa_stage_shape <- function(d, meta, title, xlim, ylim, point_size = 3.6) {
+  df <- pcoa_df(d, meta)
+  v1 <- attr(df, "var1"); v2 <- attr(df, "var2")
+
+  df$stage <- droplevels(factor(df$stage))
+df$sample_type <- droplevels(factor(df$sample_type))
+
+# enforce legend order
+df$stage <- factor(df$stage, levels = c(
+  "adult",
+  "eggs",
+  "tetraspores",
+  "Seawater_I/II",
+  "Seawater_III/IV",
+  "Stage_I",
+  "Stage_II",
+  "Stage_III",
+  "Stage_IV",
+  "Stage_V"
+))
+
+  n_stage <- nlevels(df$stage)
+  cols_use <- stage_cols
+
+  n_type <- nlevels(df$sample_type)
+  shapes_use <- setNames(shape_pool[seq_len(min(n_type, length(shape_pool)))],
+                         levels(df$sample_type))
+  if (n_type > length(shape_pool)) {
+    warning("More sample_type levels than available shapes; some shapes will repeat.")
+    shapes_use <- setNames(rep(shape_pool, length.out = n_type), levels(df$sample_type))
+  }
+
+  ggplot(df, aes(PCoA1, PCoA2, color = stage, shape = sample_type)) +
+    geom_point(size = point_size, alpha = 0.95) +
+    scale_color_manual(values = cols_use) +
+    scale_shape_manual(
+  values = shapes_use,
+  labels = function(x) {
+  x <- gsub("D\\.pulchra", "italic('D. pulchra')", x)
+  x <- gsub("U\\.australis", "italic('U. australis')", x)
+  x <- gsub("H\\.banksii", "italic('H. banksii')", x)
+
+  # make any trailing _something a literal string so plotmath can parse it
+  x <- gsub("(_[A-Za-z0-9]+)", "*'\\1'", x)
+
+  parse(text = x)
+}
+) +
+  guides(
+    shape  = guide_legend(order = 1),
+    colour = guide_legend(order = 2)
+  ) +
+    coord_cartesian(xlim = xlim, ylim = ylim) +
+    labs(
+      title = title,
+      x = sprintf("PCoA1 (%.1f%%)", v1),
+      y = sprintf("PCoA2 (%.1f%%)", v2),
+      color = "stage",
+      shape = "sample_type"
+    ) +
+    theme_natureish(base_size = 12)
+}
+
+# =========================
+# Define the 4 subsets
+# =========================
+subset_defs <- list(
+  `1_Dpulchra_Dpulchra24_26` = c("D.pulchra_26", "D.pulchra_24"),
+  `2_Uaustralis_Seawater`   = c("U.australis_26", "Seawater_26"),
+  `3_Hbanksii_Hbanksii24_26`= c("H.banksii_26", "H.banksii_24"),
+  `4_ALL_samples`           = NULL
+)
+
+# =========================
+# Prepare PCoA dfs for axis limits (per distance across ALL 4 subsets)
+# =========================
+pcoa_sets <- list(Aitchison = list(), Sorensen = list())
+dists_cache <- list()
+
+for (nm in names(subset_defs)) {
+  if (nm == "4_ALL_samples") {
+    meta_sub <- meta_all
+  } else {
+    meta_sub <- subset_meta_by_types(meta_all, subset_defs[[nm]])
+  }
+
+  if (nrow(meta_sub) < 3) {
+    warning("Skipping subset ", nm, " (too few samples).")
+    next
+  }
+
+  asv_sub <- sample_by_asv_mat_all[meta_sub$sample_ID, , drop = FALSE]
+  dists_sub <- compute_dists(asv_sub)
+  dists_cache[[nm]] <- list(meta = meta_sub, dists = dists_sub)
+
+  pcoa_sets$Aitchison[[nm]] <- pcoa_df(dists_sub$Aitchison, meta_sub)
+  pcoa_sets$Sorensen[[nm]]  <- pcoa_df(dists_sub$Sorensen,  meta_sub)
+}
+
+lims_ait <- get_global_limits(pcoa_sets$Aitchison)
+lims_sor <- get_global_limits(pcoa_sets$Sorensen)
+
+# =========================
+# Save 8 plots as separate PDFs
+# =========================
+dir.create("outputs/figures", showWarnings = FALSE, recursive = TRUE)
+
+for (nm in names(dists_cache)) {
+  meta_sub <- dists_cache[[nm]]$meta
+  dists_sub <- dists_cache[[nm]]$dists
+
+  # Aitchison
+  p_ait <- plot_pcoa_stage_shape(
+    d = dists_sub$Aitchison,
+    meta = meta_sub,
+    title = paste0("PCoA (Aitchison)"),
+    #title = paste0("PCoA (Aitchison) — ", nm),
+    xlim = lims_ait$xlim,
+    ylim = lims_ait$ylim,
+    point_size = 3.8
+  )
+  pdf(file.path("outputs/figures", paste0("PCoA_Aitchison_", nm, ".pdf")), width = 8, height = 6)
+  print(p_ait)
+  dev.off()
+
+  # Sorensen
+  p_sor <- plot_pcoa_stage_shape(
+    d = dists_sub$Sorensen,
+    meta = meta_sub,
+    title = paste0("PCoA (Sørensen)"),
+    xlim = lims_sor$xlim,
+    ylim = lims_sor$ylim,
+    point_size = 3.8
+  )
+  pdf(file.path("outputs/figures", paste0("PCoA_Sorensen_", nm, ".pdf")), width = 8, height = 6)
+  print(p_sor)
+  dev.off()
+}
+
+# Result: 8 PDFs in outputs/figures/
+# - PCoA_Aitchison_1_Dpulchra_Dpulchra24_Seawater_Seawater24.pdf
+# - PCoA_Aitchison_2_Uaustralis_Seawater.pdf
+# - PCoA_Aitchison_3_Hbanksii_Hbanksii24_Seawater_Seawater24.pdf
+# - PCoA_Aitchison_4_ALL_samples.pdf
+# - PCoA_Sorensen_1_Dpulchra_Dpulchra24_Seawater_Seawater24.pdf
+# - PCoA_Sorensen_2_Uaustralis_Seawater.pdf
+# - PCoA_Sorensen_3_Hbanksii_Hbanksii24_Seawater_Seawater24.pdf
+# - PCoA_Sorensen_4_ALL_samples.pdf
+
+```
+
+## COMBINED ATHINSON ALL SAMPLES AND SORENSEN ALL SAMPLES
+```{r}
+# =========================
+# COMBINED ALL-SAMPLES PCoA
+# A) Aitchison
+# B) Sorensen
+# =========================
+# Build the two ALL-samples plots
+# -------------------------
+p_all_ait <- plot_pcoa_stage_shape(
+  d = dists_cache[["4_ALL_samples"]]$dists$Aitchison,
+  meta = dists_cache[["4_ALL_samples"]]$meta,
+  title = "PCoA (Aitchison)",
+  xlim = lims_ait$xlim,
+  ylim = lims_ait$ylim,
+  point_size = 3.8
+)
+
+p_all_sor <- plot_pcoa_stage_shape(
+  d = dists_cache[["4_ALL_samples"]]$dists$Sorensen,
+  meta = dists_cache[["4_ALL_samples"]]$meta,
+  title = "PCoA (Sørensen)",
+  xlim = lims_sor$xlim,
+  ylim = lims_sor$ylim,
+  point_size = 3.8
+)
+
+# -------------------------
+# Combine side by side
+# with ONE shared legend
+# -------------------------
+p_all_combined <- (
+  (p_all_ait + p_all_sor) +
+    plot_layout(guides = "collect") +
+    plot_annotation(
+      tag_levels = "A",
+      theme = theme(
+        plot.tag = element_text(face = "bold", size = 14)
+      )
+    )
+) & theme(
+  legend.position = "right"
+)
+# -------------------------
+# Save
+# -------------------------
+# ggsave(
+#   "outputs/figures/PCoA_ALLsamples_Aitchison_Sorensen_combined.pdf",
+#   p_all_combined,
+#   width = 14,
+#   height = 6,
+#   bg = "white"
+#)
+
+p_all_combined
+
+```
+
+## COMBINED PLOTS A_B_C
+```{r}
+# =========================
+# COMBINED PCoA FIGURES
+# Order:
+#   A = U. australis + seawater
+#   B = H. banksii
+#   C = D. pulchra
+#
+# Uses:
+#   - panel tags A, B, C (instead of putting A/B/C into plot titles)
+#   - italic species names
+# =========================
+# Small helper: same plotting function, but no A/B/C in title
+# -------------------------
+plot_pcoa_stage_shape <- function(d, meta, title = NULL, xlim, ylim, point_size = 3.6) {
+  df <- pcoa_df(d, meta)
+  v1 <- attr(df, "var1"); v2 <- attr(df, "var2")
+
+  df$stage <- droplevels(factor(df$stage))
+df$sample_type <- droplevels(factor(df$sample_type))
+
+# enforce legend order
+df$stage <- factor(df$stage, levels = c(
+  "adult",
+  "eggs",
+  "tetraspores",
+  "Seawater_I/II",
+  "Seawater_III/IV",
+  "Stage_I",
+  "Stage_II",
+  "Stage_III",
+  "Stage_IV",
+  "Stage_V"
+))
+
+  n_stage <- nlevels(df$stage)
+  cols_use <- stage_cols
+
+  n_type <- nlevels(df$sample_type)
+  shapes_use <- setNames(shape_pool[seq_len(min(n_type, length(shape_pool)))],
+                         levels(df$sample_type))
+  if (n_type > length(shape_pool)) {
+    warning("More sample_type levels than available shapes; some shapes will repeat.")
+    shapes_use <- setNames(rep(shape_pool, length.out = n_type), levels(df$sample_type))
+  }
+
+  ggplot(df, aes(PCoA1, PCoA2, color = stage, shape = sample_type)) +
+    geom_point(size = point_size, alpha = 0.95) +
+    scale_color_manual(values = cols_use) +
+    scale_shape_manual(
+      values = shapes_use,
+      labels = function(x) {
+        x <- gsub("D\\.pulchra", "italic('D. pulchra')", x)
+        x <- gsub("U\\.australis", "italic('U. australis')", x)
+        x <- gsub("H\\.banksii", "italic('H. banksii')", x)
+        x <- gsub("(_[A-Za-z0-9]+)", "*'\\1'", x)
+        parse(text = x)
+      }
+    ) +
+    guides(
+      shape  = guide_legend(order = 1),
+      colour = guide_legend(order = 2)
+    ) +
+    coord_cartesian(xlim = xlim, ylim = ylim) +
+    labs(
+      title = title,
+      x = sprintf("PCoA1 (%.1f%%)", v1),
+      y = sprintf("PCoA2 (%.1f%%)", v2),
+      color = "stage",
+      shape = "sample_type"
+    ) +
+    theme_natureish(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5)
+    )
+}
+
+# =========================
+# AITCHISON combined figure
+# =========================
+
+pA_ait <- plot_pcoa_stage_shape(
+  d = dists_cache[["2_Uaustralis_Seawater"]]$dists$Aitchison,
+  meta = dists_cache[["2_Uaustralis_Seawater"]]$meta,
+  title = expression(italic("U. australis") * " + seawater"),
+  xlim = lims_ait$xlim,
+  ylim = lims_ait$ylim,
+  point_size = 3.8
+) + theme(legend.position = "right")
+
+pB_ait <- plot_pcoa_stage_shape(
+  d = dists_cache[["3_Hbanksii_Hbanksii24_26"]]$dists$Aitchison,
+  meta = dists_cache[["3_Hbanksii_Hbanksii24_26"]]$meta,
+  title = expression(italic("H. banksii")),
+  xlim = lims_ait$xlim,
+  ylim = lims_ait$ylim,
+  point_size = 3.8
+) + theme(legend.position = "right")
+
+pC_ait <- plot_pcoa_stage_shape(
+  d = dists_cache[["1_Dpulchra_Dpulchra24_26"]]$dists$Aitchison,
+  meta = dists_cache[["1_Dpulchra_Dpulchra24_26"]]$meta,
+  title = expression(italic("D. pulchra")),
+  xlim = lims_ait$xlim,
+  ylim = lims_ait$ylim,
+  point_size = 3.8
+) + theme(legend.position = "right")
+
+p_ait_ABC <- (pA_ait + pB_ait + pC_ait + plot_layout(ncol = 3)) +
+  plot_annotation(
+    tag_levels = "A",
+    theme = theme(
+      plot.tag = element_text(face = "bold", size = 14)
+    )
+  )
+
+pdf("outputs/figures/PCoA_Aitchison_ABC.pdf", width = 22, height = 6)
+print(p_ait_ABC)
+dev.off()
+
+# =========================
+# SORENSEN combined figure
+# =========================
+
+pA_sor <- plot_pcoa_stage_shape(
+  d = dists_cache[["2_Uaustralis_Seawater"]]$dists$Sorensen,
+  meta = dists_cache[["2_Uaustralis_Seawater"]]$meta,
+  title = expression(italic("U. australis") * " + seawater"),
+  xlim = lims_sor$xlim,
+  ylim = lims_sor$ylim,
+  point_size = 3.8
+) + theme(legend.position = "right")
+
+pB_sor <- plot_pcoa_stage_shape(
+  d = dists_cache[["3_Hbanksii_Hbanksii24_26"]]$dists$Sorensen,
+  meta = dists_cache[["3_Hbanksii_Hbanksii24_26"]]$meta,
+  title = expression(italic("H. banksii")),
+  xlim = lims_sor$xlim,
+  ylim = lims_sor$ylim,
+  point_size = 3.8
+) + theme(legend.position = "right")
+
+pC_sor <- plot_pcoa_stage_shape(
+  d = dists_cache[["1_Dpulchra_Dpulchra24_26"]]$dists$Sorensen,
+  meta = dists_cache[["1_Dpulchra_Dpulchra24_26"]]$meta,
+  title = expression(italic("D. pulchra")),
+  xlim = lims_sor$xlim,
+  ylim = lims_sor$ylim,
+  point_size = 3.8
+) + theme(legend.position = "right")
+
+p_sor_ABC <- (pA_sor + pB_sor + pC_sor + plot_layout(ncol = 3)) +
+  plot_annotation(
+    tag_levels = "A",
+    theme = theme(
+      plot.tag = element_text(face = "bold", size = 14)
+    )
+  )
+
+pdf("outputs/figures/PCoA_Sorensen_ABC.pdf", width = 22, height = 6)
+print(p_sor_ABC)
+dev.off()
+
+# -------------------------
+# Save individual Aitchison plots without titles
+# -------------------------
+pA_ait_notitle <- pA_ait + labs(title = NULL)
+pB_ait_notitle <- pB_ait + labs(title = NULL)
+pC_ait_notitle <- pC_ait + labs(title = NULL)
+
+# ggsave(
+#   "outputs/figures/PCoA_Aitchison_Uaustralis_seawater.pdf",
+#   pA_ait_notitle,
+#   width = 8, height = 6
+#)
+
+# ggsave(
+#   "outputs/figures/PCoA_Aitchison_Hbanksii.pdf",
+#   pB_ait_notitle,
+#   width = 8, height = 6
+#)
+
+# ggsave(
+#   "outputs/figures/PCoA_Aitchison_Dpulchra.pdf",
+#   pC_ait_notitle,
+#   width = 8, height = 6
+#)
+```
+
+## ALPHA DIVERSITY
+```{r}
+# ===============================
+# ALPHA DIVERSITY
+# - Metrics: Richness, Shannon
+# - Rarefaction within subsets:
+#     U.australis + seawater
+#     H.banksii
+#     D.pulchra
+# - Stats: one-way ANOVA + Tukey HSD within species across stages
+# - Significant differences shown as compact letters
+# ===============================
+dir.create("outputs/figures", showWarnings = FALSE, recursive = TRUE)
+dir.create("outputs/files", showWarnings = FALSE, recursive = TRUE)
+
+# -------------------------------
+# 1) Prepare ASV table + metadata
+# -------------------------------
+
+# Check that sample order matches between the ASV table and metadata
+stopifnot(identical(colnames(asv_abund_final_clean), rownames(fact_reordered)))
+
+# Transpose ASV table so rows = samples and columns = ASVs
+sample_by_asv <- as.data.frame(t(asv_abund_final_clean))
+sample_by_asv$sample_ID <- rownames(sample_by_asv)
+
+# Convert metadata row names into an explicit sample_ID column
+meta_alpha <- fact_reordered %>%
+  as.data.frame() #%>%
+  #tibble::rownames_to_column("sample_ID")
+
+# Keep only ASV columns (everything except sample_ID)
+asv_cols <- setdiff(colnames(sample_by_asv), "sample_ID")
+
+# -------------------------------
+# 2) Define rarefaction groups
+# -------------------------------
+
+# Join ASV counts to metadata, then assign the rarefaction subset
+# case_when() = create a new variable based on multiple conditions
+alpha_input <- sample_by_asv %>%
+  left_join(meta_alpha, by = "sample_ID") %>%
+  mutate(
+    rarefy_group = case_when(
+      seaweed == "U.australis" | stage %in% c("Seawater_I/II", "Seawater_III/IV") ~ "Uaustralis_seawater",
+      seaweed == "H.banksii" ~ "Hbanksii",
+      seaweed == "D.pulchra" ~ "Dpulchra",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(rarefy_group))
+
+# -------------------------------
+# 3) Rarefy counts within each subset
+# -------------------------------
+
+# This function rarefies one subset to its minimum sequencing depth
+rarefy_one_group <- function(df) {
+  # as.matrix() converts the count table to a numeric matrix for vegan functions
+  mat <- as.matrix(df[, asv_cols, drop = FALSE])
+
+  # rowSums() gives total reads per sample
+  min_depth <- min(rowSums(mat))
+
+  # rrarefy() randomly subsamples each sample to the same depth
+  rarefied_mat <- vegan::rrarefy(mat, sample = min_depth)
+
+  rarefied_df <- as.data.frame(rarefied_mat)
+  rarefied_df$sample_ID <- df$sample_ID
+  rarefied_df$rarefy_depth <- min_depth
+
+  rarefied_df
+}
+
+set.seed(123)  # ensures reproducible random rarefaction
+
+# split() separates the data frame into one data frame per rarefy_group
+# lapply() applies the function to each subset
+rarefied_counts <- alpha_input %>%
+  split(.$rarefy_group) %>%
+  lapply(rarefy_one_group) %>%
+  bind_rows()
+
+# Optional: save the rarefaction depth used for each subset
+rarefaction_depths <- alpha_input %>%
+  group_by(rarefy_group) %>%
+  summarise(
+    min_depth = min(rowSums(across(all_of(asv_cols)))),
+    max_depth = max(rowSums(across(all_of(asv_cols)))),
+    .groups = "drop"
+  )
+
+# write.csv(
+#   rarefaction_depths,
+#   "outputs/files/Alpha_rarefaction_depths.csv",
+#   row.names = FALSE
+#)
+
+# -------------------------------
+# 4) Calculate alpha diversity
+# -------------------------------
+
+# specnumber() = observed richness (number of ASVs present)
+# diversity(..., index = "shannon") = Shannon diversity
+rarefied_matrix <- as.matrix(rarefied_counts[, asv_cols, drop = FALSE])
+
+alpha_df <- data.frame(
+  sample_ID = rarefied_counts$sample_ID,
+  rarefy_depth = rarefied_counts$rarefy_depth,
+  Richness = vegan::specnumber(rarefied_matrix),
+  Shannon = vegan::diversity(rarefied_matrix, index = "shannon")
+) %>%
+  left_join(meta_alpha, by = "sample_ID")
+
+# Keep only macroalgal samples for plotting/statistics
+alpha_df <- alpha_df %>%
+  filter(seaweed %in% c("U.australis", "H.banksii", "D.pulchra"))
+
+# -------------------------------
+# 5) Set factor order for plotting
+# -------------------------------
+
+stage_order <- c(
+  "adult",
+  "eggs",
+  "tetraspores",
+  "Seawater_I/II",
+  "Seawater_III/IV",
+  "Stage_I",
+  "Stage_II",
+  "Stage_III",
+  "Stage_IV",
+  "Stage_V"
+)
+
+alpha_df <- alpha_df %>%
+  mutate(
+    stage = factor(stage, levels = stage_order),
+    seaweed = factor(seaweed, levels = c("U.australis", "H.banksii", "D.pulchra"))
+  )
+
+# -------------------------------
+# 6) Plot settings
+# -------------------------------
+
+stage_cols <- c(
+"adult"            = "#D81B60",
+"eggs"             = "#1E88E5",
+"tetraspores"      =   "#3949AB",
+"Seawater_I/II"    = "#D55E00",
+"Seawater_III/IV"  = "#C0CA33",
+"Stage_I"      = "#43A047",
+"Stage_II"    = "#FFC107",
+"Stage_III"  = "#6D4C41",
+"Stage_IV"          = "#8E24AA",
+"Stage_V"         = "#004D40"
+#,"XXX"        = "#D55E00",
+ # XXX"         = "#C0CA33",
+ # XXX"          = "#3949AB"
+)
+
+theme_alpha <- function(base_size = 12) {
+  theme_classic(base_size = base_size) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.text.x = element_text(angle = 45, hjust = 1, color = "black"),
+      axis.text.y = element_text(color = "black"),
+      legend.position = "none",
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4)
+    )
+}
+
+# -------------------------------
+# 7) Statistics helpers
+# -------------------------------
+
+# Get compact letter display from Tukey HSD
+# Groups sharing a letter are NOT significantly different
+get_letters_one_species <- function(df, metric) {
+
+  sub <- df %>%
+    filter(!is.na(.data[[metric]]), !is.na(stage)) %>%
+    droplevels()
+
+  # Keep only stages with at least 2 samples
+  stage_counts <- table(sub$stage)
+  keep_stages <- names(stage_counts[stage_counts >= 2])
+
+  sub <- sub %>%
+    filter(stage %in% keep_stages) %>%
+    droplevels()
+
+  if (nlevels(sub$stage) < 2) {
+    return(data.frame(stage = levels(sub$stage), Letters = "a"))
+  }
+
+  # aov() = one-way ANOVA
+  fit <- aov(stats::as.formula(paste(metric, "~ stage")), data = sub)
+
+  # TukeyHSD() = all pairwise post hoc comparisons
+  tuk <- TukeyHSD(fit, "stage")
+
+  # multcompLetters4() converts pairwise comparisons into compact letters
+  cld <- multcompView::multcompLetters4(fit, tuk)
+  letters_vec <- cld[[1]]$Letters
+
+  data.frame(
+    stage = names(letters_vec),
+    Letters = as.character(letters_vec),
+    row.names = NULL
+  )
+}
+
+# Save ANOVA and Tukey results for one species + one metric
+run_alpha_stats_one_species <- function(df, metric, species_name) {
+
+  sub <- df %>%
+    filter(seaweed == species_name, !is.na(.data[[metric]]), !is.na(stage)) %>%
+    droplevels()
+
+  stage_counts <- table(sub$stage)
+  keep_stages <- names(stage_counts[stage_counts >= 2])
+
+  sub <- sub %>%
+    filter(stage %in% keep_stages) %>%
+    droplevels()
+
+  if (nlevels(sub$stage) < 2) {
+    return(NULL)
+  }
+
+  fit <- aov(stats::as.formula(paste(metric, "~ stage")), data = sub)
+
+  anova_tab <- as.data.frame(summary(fit)[[1]])
+  anova_tab$term <- rownames(anova_tab)
+  rownames(anova_tab) <- NULL
+
+  tukey_tab <- as.data.frame(TukeyHSD(fit, "stage")$stage)
+  tukey_tab$contrast <- rownames(tukey_tab)
+  rownames(tukey_tab) <- NULL
+
+  list(anova = anova_tab, tukey = tukey_tab)
+}
+
+# -------------------------------
+# 8) Plot one metric for one species
+# -------------------------------
+
+plot_alpha_one_species <- function(df, metric, species_name, outfile) {
+
+  sub <- df %>%
+    filter(seaweed == species_name, !is.na(.data[[metric]]), !is.na(stage)) %>%
+    droplevels() %>%
+    mutate(stage = droplevels(stage))
+
+  letters_df <- get_letters_one_species(sub, metric)
+
+  # Position letters above the highest point in each stage
+  letter_pos <- sub %>%
+    group_by(stage) %>%
+    summarise(y = max(.data[[metric]], na.rm = TRUE), .groups = "drop") %>%
+    left_join(letters_df, by = "stage")
+
+  y_max <- max(letter_pos$y, na.rm = TRUE)
+  offset <- 0.08 * y_max
+
+  letter_pos <- letter_pos %>%
+    mutate(
+      Letters = ifelse(is.na(Letters), "", Letters),
+      label_y = y + offset
+    )
+
+  species_title <- switch(
+    species_name,
+    "U.australis" = expression(italic("U. australis")),
+    "H.banksii"   = expression(italic("H. banksii")),
+    "D.pulchra"   = expression(italic("D. pulchra")),
+    species_name
+  )
+
+  p <- ggplot(sub, aes(x = stage, y = .data[[metric]], fill = stage)) +
+    geom_boxplot(
+      width = 0.7,
+      outlier.shape = NA,
+      colour = "black",
+      linewidth = 0.35
+    ) +
+    geom_jitter(
+      width = 0.12,
+      height = 0,
+      size = 2.2,
+      shape = 21,
+      fill = "white",
+      colour = "black",
+      stroke = 0.35
+    ) +
+    geom_text(
+      data = letter_pos,
+      aes(x = stage, y = label_y, label = Letters),
+      inherit.aes = FALSE,
+      vjust = 0,
+      size = 5
+    ) +
+    scale_fill_manual(values = stage_cols, drop = TRUE) +
+    labs(title = species_title, x = NULL, y = metric) +
+    coord_cartesian(ylim = c(0, max(letter_pos$label_y, na.rm = TRUE) * 1.08)) +
+    theme_alpha()
+
+  # ggsave(outfile, p, width = 7, height = 5.5)
+  # p
+}
+
+# -------------------------------
+# 9) Make single-metric plots
+# -------------------------------
+
+p_rich_u <- plot_alpha_one_species(alpha_df, "Richness", "U.australis",
+                                   "outputs/figures/Alpha_Richness_Uaustralis.pdf")
+p_rich_h <- plot_alpha_one_species(alpha_df, "Richness", "H.banksii",
+                                   "outputs/figures/Alpha_Richness_Hbanksii.pdf")
+p_rich_d <- plot_alpha_one_species(alpha_df, "Richness", "D.pulchra",
+                                   "outputs/figures/Alpha_Richness_Dpulchra.pdf")
+
+p_shan_u <- plot_alpha_one_species(alpha_df, "Shannon", "U.australis",
+                                   "outputs/figures/Alpha_Shannon_Uaustralis.pdf")
+p_shan_h <- plot_alpha_one_species(alpha_df, "Shannon", "H.banksii",
+                                   "outputs/figures/Alpha_Shannon_Hbanksii.pdf")
+p_shan_d <- plot_alpha_one_species(alpha_df, "Shannon", "D.pulchra",
+                                   "outputs/figures/Alpha_Shannon_Dpulchra.pdf")
+
+p_rich_u
+p_rich_h
+p_rich_d
+p_shan_u
+p_shan_h
+p_shan_d
+
+# -------------------------------
+# 10) Combined plots
+# -------------------------------
+
+# pivot_longer() changes wide data into long data:
+# Richness and Shannon become values in one column called "Metric"
+alpha_long <- alpha_df %>%
+  pivot_longer(
+    cols = c(Richness, Shannon),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+get_letters_species_metric <- function(df, species_name, metric_name) {
+
+  sub <- df %>%
+    filter(seaweed == species_name, Metric == metric_name, !is.na(Value), !is.na(stage)) %>%
+    droplevels()
+
+  stage_counts <- table(sub$stage)
+  keep_stages <- names(stage_counts[stage_counts >= 2])
+
+  sub <- sub %>%
+    filter(stage %in% keep_stages) %>%
+    droplevels()
+
+  if (nlevels(sub$stage) < 2) {
+    return(data.frame(
+      stage = levels(sub$stage),
+      Metric = metric_name,
+      Letters = "a"
+    ))
+  }
+
+  fit <- aov(Value ~ stage, data = sub)
+  tuk <- TukeyHSD(fit, "stage")
+  cld <- multcompView::multcompLetters4(fit, tuk)
+  letters_vec <- cld[[1]]$Letters
+
+  data.frame(
+    stage = names(letters_vec),
+    Metric = metric_name,
+    Letters = as.character(letters_vec),
+    row.names = NULL
+  )
+}
+
+plot_alpha_combined <- function(df, species_name, outfile) {
+
+  sub <- df %>%
+    filter(seaweed == species_name, !is.na(Value), !is.na(stage)) %>%
+    droplevels()
+
+  letters_df <- bind_rows(
+    get_letters_species_metric(df, species_name, "Richness"),
+    get_letters_species_metric(df, species_name, "Shannon")
+  )
+
+  letter_pos <- sub %>%
+    group_by(Metric, stage) %>%
+    summarise(y = max(Value, na.rm = TRUE), .groups = "drop") %>%
+    left_join(letters_df, by = c("Metric", "stage")) %>%
+    group_by(Metric) %>%
+    mutate(
+      offset = 0.08 * max(y, na.rm = TRUE),
+      label_y = y + offset,
+      Letters = ifelse(is.na(Letters), "", Letters)
+    ) %>%
+    ungroup()
+
+  p <- ggplot(sub, aes(x = stage, y = Value, fill = stage)) +
+    geom_boxplot(
+      width = 0.7,
+      outlier.shape = NA,
+      colour = "black",
+      linewidth = 0.35
+    ) +
+    geom_jitter(
+      width = 0.12,
+      height = 0,
+      size = 2,
+      shape = 21,
+      fill = "white",
+      colour = "black",
+      stroke = 0.35
+    ) +
+    geom_text(
+      data = letter_pos,
+      aes(x = stage, y = label_y, label = Letters),
+      inherit.aes = FALSE,
+      vjust = 0,
+      size = 5
+    ) +
+    facet_wrap(~Metric, scales = "free_y") +
+    scale_fill_manual(values = stage_cols, drop = TRUE) +
+    labs(x = NULL, y = NULL) +
+    theme_alpha() +
+    theme(
+      strip.text = element_text(face = "bold"),
+      plot.title = element_blank()
+    )
+
+  # ggsave(outfile, p, width = 9, height = 5)
+  # p
+}
+
+p_alpha_U <- plot_alpha_combined(alpha_long, "U.australis",
+                                 "outputs/figures/Alpha_Uaustralis_combined.pdf")
+p_alpha_H <- plot_alpha_combined(alpha_long, "H.banksii",
+                                 "outputs/figures/Alpha_Hbanksii_combined.pdf")
+p_alpha_D <- plot_alpha_combined(alpha_long, "D.pulchra",
+                                 "outputs/figures/Alpha_Dpulchra_combined.pdf")
+
+p_alpha_U
+p_alpha_H
+p_alpha_D
+
+# -------------------------------
+# 11) Save ANOVA and Tukey tables
+# -------------------------------
+
+species_vec <- c("U.australis", "H.banksii", "D.pulchra")
+metric_vec  <- c("Richness", "Shannon")
+
+anova_out <- list()
+tukey_out <- list()
+
+for (sp in species_vec) {
+  for (met in metric_vec) {
+    res <- run_alpha_stats_one_species(alpha_df, met, sp)
+
+    if (!is.null(res)) {
+      anova_out[[paste(sp, met, sep = "_")]] <- res$anova %>%
+        mutate(seaweed = sp, metric = met)
+
+      tukey_out[[paste(sp, met, sep = "_")]] <- res$tukey %>%
+        mutate(seaweed = sp, metric = met)
+    }
+  }
+}
+
+anova_out_df <- bind_rows(anova_out)
+tukey_out_df <- bind_rows(tukey_out)
+
+anova_out_df <- anova_out_df %>%
+  mutate(
+    sig = case_when(
+      `Pr(>F)` < 0.001 ~ "***",
+      `Pr(>F)` < 0.01  ~ "**",
+      `Pr(>F)` < 0.05  ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+tukey_out_df <- tukey_out_df %>%
+  mutate(
+    sig = case_when(
+      `p adj` < 0.001 ~ "***",
+      `p adj` < 0.01  ~ "**",
+      `p adj` < 0.05  ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+# write.csv(alpha_df,
+#           "outputs/files/Alpha_diversity_per_sample.csv",
+#           row.names = FALSE)
+# 
+# write.csv(anova_out_df,
+#           "outputs/files/Alpha_diversity_ANOVA_results.csv",
+#           row.names = FALSE)
+# 
+# write.csv(tukey_out_df,
+#           "outputs/files/Alpha_diversity_Tukey_results.csv",
+#           row.names = FALSE)
+
+# Optional checks for one species/metric
+run_alpha_stats_one_species(alpha_df, "Richness", "U.australis")$tukey
+get_letters_one_species(alpha_df %>% filter(seaweed == "U.australis"), "Richness")
+
+# Keep only significant Tukey comparisons
+tukey_sig_df <- tukey_out_df %>%
+  filter(`p adj` < 0.05) %>%
+  mutate(
+    sig = case_when(
+      `p adj` < 0.001 ~ "***",
+      `p adj` < 0.01  ~ "**",
+      `p adj` < 0.05  ~ "*"
+    )
+  ) %>%
+  dplyr::select(seaweed, metric, contrast, diff, lwr, upr, `p adj`, sig)
+
+# write.csv(
+#   tukey_sig_df,
+#   "outputs/files/Alpha_diversity_Tukey_significant_results.csv",
+#   row.names = FALSE
+#)
+
+```
+
+## HEATMAPS mvabund results
+
+## Ulva
+```{r}
+# ---- HEATMAP: Ulva + Seawater, selected ASVs only ----
+meta_u_sw <- fact_cleaned_with_new_samples %>%
+  mutate(
+    sample_group = case_when(
+      sample_type == "U.australis_26" ~ "Ulva",
+      sample_type == "Seawater_26" ~ "Seawater",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(sample_group)) %>%
+  distinct(sample_ID, .keep_all = TRUE)
+
+keep_samples <- meta_u_sw$sample_ID
+
+# 2) Build ASV count matrix for ONLY those samples and ONLY your ASVs
+asv_mat_counts <- ASV_abundance_table %>%
+  filter(ASV_ID %in% asvs_of_interest_Ulva) %>%
+  dplyr::select(ASV_ID, any_of(keep_samples)) %>%
+  column_to_rownames("ASV_ID") %>%
+  as.matrix()
+
+# Safety: drop samples that ended up missing in the ASV table
+asv_mat_counts <- asv_mat_counts[, colnames(asv_mat_counts) %in% keep_samples, drop = FALSE]
+
+# 3) Convert to relative abundance per sample (column-wise)
+asv_mat_rel <- sweep(asv_mat_counts, 2, colSums(asv_mat_counts), FUN = "/")
+asv_mat_rel[is.na(asv_mat_rel)] <- 0
+
+# 4) Transform for plotting (log10 of percent + small pseudocount)
+#    This tends to give a ~0–2.x range similar to your example heatmap.
+asv_mat_plot <- log10(asv_mat_rel * 100 + 1e-6)
+
+# 5) Row labels: ASV__Genus (fallback to Unclassified)
+tax_labs <- ASV_taxonomy_table %>%
+  filter(ASV_ID %in% rownames(asv_mat_plot)) %>%
+  mutate(Genus = ifelse(is.na(Genus) | Genus == "", "Unclassified", Genus)) %>%
+  distinct(ASV_ID, Genus)
+
+row_lab_vec <- setNames(paste0(tax_labs$ASV_ID, "__", tax_labs$Genus), tax_labs$ASV_ID)
+rownames(asv_mat_plot) <- row_lab_vec[rownames(asv_mat_plot)]
+
+# 6) Column annotation (Ulva vs Seawater; keep stage if you want)
+ann_col <- meta_u_sw %>%
+  dplyr::select(sample_ID, sample_group, stage) %>%
+  tibble::column_to_rownames("sample_ID")
+
+# Ensure annotation order matches matrix column order
+ann_col <- ann_col[colnames(asv_mat_plot), , drop = FALSE]
+
+# 7) Colors similar to your example (dark low -> blue -> yellow -> red)
+heat_cols <- colorRampPalette(c("black", "#2C7BB6", "#FFFFBF", "#D7191C"))(100)
+row_labels <- tax_labs %>%
+  mutate(
+    label = paste0(ASV_ID, "~~italic('", Genus, "')")
+  )
+
+label_expr <- parse(text = row_labels$label)
+names(label_expr) <- row_labels$ASV_ID
+
+rownames(asv_mat_plot) <- row_labels$ASV_ID
+
+# Fixed colours for annotations
+ann_colors <- list(
+  sample_group = c(
+    Ulva           = "#21908C",
+    Seawater       = "#F8961E",
+    "D.pulchra_24" = "#21908C",
+    "H.banksii_24" = "#21908C",
+    "D.pulchra_26" = "#F8961E",
+    "H.banksii_26" = "#F8961E"
+  ),
+  
+  stage = c(
+    "adult"            = "#D81B60",
+"eggs"             = "#1E88E5",
+"tetraspores"      =   "#3949AB",
+"Seawater_I/II"    = "#D55E00",
+"Seawater_III/IV"  = "#C0CA33",
+"Stage_I"      = "#43A047",
+"Stage_II"    = "#FFC107",
+"Stage_III"  = "#6D4C41",
+"Stage_IV"          = "#8E24AA",
+"Stage_V"         = "#004D40"
+#,"XXX"        = "#D55E00",
+ # XXX"         = "#C0CA33",
+ # XXX"          = "#3949AB"
+  )
+)
+
+# fixed colour scale
+heat_breaks <- seq(-3, 2, length.out = 100)
+
+heat_cols <- colorRampPalette(
+  c("black", "#2C7BB6", "#FFFFBF", "#D7191C")
+)(length(heat_breaks) - 1)
+
+# clean legend ticks
+legend_breaks <- c(-3, -2, -1, 0, 1, 2)
+legend_labels <- c("-3", "-2", "-1", "0", "1", "2")
+
+#Order columns by stage
+ann_col$stage <- factor(
+  ann_col$stage,
+  levels = c("Stage_I","Stage_II","Stage_III", "Stage_IV", "Seawater_I/II", "Seawater_III/IV")
+)
+
+ann_col <- ann_col %>% arrange(stage)
+asv_mat_plot <- asv_mat_plot[, rownames(ann_col)]
+
+#Compute where stage groups change
+stage_lengths <- table(ann_col$stage)
+gaps_col <- cumsum(stage_lengths)
+gaps_col <- gaps_col[-length(gaps_col)]
+
+pdf("outputs/figures/ASV_heatmap_Ulva.pdf", width = 13, height = 12)
+pheatmap(
+  asv_mat_plot,
+  name = "log10(% + 1e-6)",
+  color = heat_cols,
+  legend_breaks = legend_breaks,
+  legend_labels = legend_labels,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  treeheight_row = 0,
+  annotation_col = ann_col,
+  annotation_colors = ann_colors,
+   labels_row = label_expr,
+  gaps_col = gaps_col,
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  fontsize_row = 10,
+  fontsize_col = 10,
+  border_color = NA,
+  display_numbers = TRUE,
+  number_format = "%.1f",
+  main = ""
+)
+dev.off()
+
+```
+
+D.pulchra - heatmaps
+```{r}
+# ---- HEATMAP: D.pulchra + Seawater, selected ASVs only ----
+meta_dp_sw <- fact_cleaned_with_new_samples %>%
+  mutate(
+    sample_group = case_when(
+      sample_type == "D.pulchra_24" ~ "D.pulchra_24",
+      sample_type == "D.pulchra_26" ~ "D.pulchra_26",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(sample_group)) %>%
+  distinct(sample_ID, .keep_all = TRUE)
+
+keep_samples <- meta_dp_sw$sample_ID
+
+# 2) Build ASV count matrix for ONLY those samples and ONLY your ASVs
+#    (swap asvs_of_interest_Ulva -> your D.pulchra ASV vector if you have one)
+asv_mat_counts <- ASV_abundance_table %>%
+  filter(ASV_ID %in% asvs_of_interest_Delisea) %>%   # <--- change vector name if needed
+  dplyr::select(ASV_ID, any_of(keep_samples)) %>%
+  column_to_rownames("ASV_ID") %>%
+  as.matrix()
+
+# Safety: drop samples that ended up missing in the ASV table
+asv_mat_counts <- asv_mat_counts[, colnames(asv_mat_counts) %in% keep_samples, drop = FALSE]
+
+# 3) Convert to relative abundance per sample (column-wise)
+asv_mat_rel <- sweep(asv_mat_counts, 2, colSums(asv_mat_counts), FUN = "/")
+asv_mat_rel[is.na(asv_mat_rel)] <- 0
+
+# 4) Transform for plotting (log10 of percent + small pseudocount)
+asv_mat_plot <- log10(asv_mat_rel * 100 + 1e-6)
+
+# 5) Row labels: ASV__Genus (fallback to Unclassified)
+tax_labs <- ASV_taxonomy_table %>%
+  filter(ASV_ID %in% rownames(asv_mat_plot)) %>%
+  mutate(Genus = ifelse(is.na(Genus) | Genus == "", "Unclassified", Genus)) %>%
+  distinct(ASV_ID, Genus)
+
+# 6) Column annotation (D.pulchra vs Seawater; keep stage if you want)
+ann_col <- meta_dp_sw %>%
+  dplyr::select(sample_ID, sample_group, stage) %>%
+  tibble::column_to_rownames("sample_ID")
+
+ann_col <- ann_col[colnames(asv_mat_plot), , drop = FALSE]
+
+#Order columns by sample_group (24 first, then 26)
+ann_col$sample_group <- factor(
+  ann_col$sample_group,
+  levels = c("D.pulchra_24", "D.pulchra_26")
+)
+
+# reorder annotation
+ann_col <- ann_col %>% arrange(sample_group)
+
+# reorder heatmap matrix to match
+asv_mat_plot <- asv_mat_plot[, rownames(ann_col)]
+
+# 7) Colors similar to your example (dark low -> blue -> yellow -> red)
+heat_cols <- colorRampPalette(c("black", "#2C7BB6", "#FFFFBF", "#D7191C"))(100)
+
+# --- Italic genus labels (ComplexHeatmap expressions) ---
+# NOTE: pheatmap won't use these, but ComplexHeatmap will.
+row_labels <- tax_labs %>%
+  mutate(label = paste0(ASV_ID, "~~italic('", Genus, "')"))
+
+label_expr <- parse(text = row_labels$label)
+names(label_expr) <- row_labels$ASV_ID
+
+# Keep matrix rownames as ASV_ID for the row_labels mapping to work
+rownames(asv_mat_plot) <- row_labels$ASV_ID
+
+#Order columns by stage
+ann_col$stage <- factor(
+  ann_col$stage,
+  levels = c("adult","tetraspores", "eggs","Stage_I","Stage_II","Stage_III")
+)
+
+ann_col <- ann_col %>% arrange(stage)
+asv_mat_plot <- asv_mat_plot[, rownames(ann_col)]
+
+#Compute where stage groups change
+stage_lengths <- table(ann_col$stage)
+gaps_col <- cumsum(stage_lengths)
+gaps_col <- gaps_col[-length(gaps_col)]
+
+# 8A) pheatmap (numbers in tiles; genus NOT truly italic here)
+
+pdf("outputs/figures/ASV_heatmap_Delisea.pdf", width = 13, height = 12)
+pheatmap(
+  asv_mat_plot,
+  name = "log10(% + 1e-6)",
+  color = heat_cols,
+  legend_breaks = legend_breaks,
+  legend_labels = legend_labels,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  treeheight_row = 0,
+  annotation_col = ann_col,
+  annotation_colors = ann_colors,
+  labels_row = label_expr,
+  gaps_col = gaps_col,
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  fontsize_row = 10,
+  fontsize_col = 10,
+  border_color = NA,
+  display_numbers = TRUE,
+  number_format = "%.1f",
+  main = ""
+)
+dev.off()
+
+```
+
+## Hormosira
+```{r}
+# ---- HEATMAP: H.banksii + Seawater, selected ASVs only ----
+meta_hb_sw <- fact_cleaned_with_new_samples %>%
+  mutate(
+    sample_group = case_when(
+      sample_type == "H.banksii_24" ~ "H.banksii_24",
+      sample_type == "H.banksii_26" ~ "H.banksii_26",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(sample_group)) %>%
+  distinct(sample_ID, .keep_all = TRUE)
+
+keep_samples <- meta_hb_sw$sample_ID
+
+# 2) Build ASV count matrix for ONLY those samples and ONLY your ASVs
+asv_mat_counts <- ASV_abundance_table %>%
+  filter(ASV_ID %in% asvs_of_interest_Hormosira) %>%   # <--- define this vector
+  dplyr::select(ASV_ID, any_of(keep_samples)) %>%
+  column_to_rownames("ASV_ID") %>%
+  as.matrix()
+
+# Safety: drop samples that ended up missing in the ASV table
+asv_mat_counts <- asv_mat_counts[, colnames(asv_mat_counts) %in% keep_samples, drop = FALSE]
+
+# 3) Convert to relative abundance per sample (column-wise)
+asv_mat_rel <- sweep(asv_mat_counts, 2, colSums(asv_mat_counts), FUN = "/")
+asv_mat_rel[is.na(asv_mat_rel)] <- 0
+
+# 4) Transform for plotting (log10 of percent + small pseudocount)
+asv_mat_plot <- log10(asv_mat_rel * 100 + 1e-6)
+
+# 5) Tax labels for italic genus in ComplexHeatmap
+tax_labs <- ASV_taxonomy_table %>%
+  filter(ASV_ID %in% rownames(asv_mat_plot)) %>%
+  mutate(Genus = ifelse(is.na(Genus) | Genus == "", "Unclassified", Genus)) %>%
+  distinct(ASV_ID, Genus)
+
+# 6) Column annotation (H.banksii vs Seawater; keep stage if you want)
+ann_col <- meta_hb_sw %>%
+  dplyr::select(sample_ID, sample_group, stage) %>%
+  tibble::column_to_rownames("sample_ID")
+
+ann_col <- ann_col[colnames(asv_mat_plot), , drop = FALSE]
+
+#Order columns by sample_group (24 first, then 26)
+ann_col$sample_group <- factor(
+  ann_col$sample_group,
+  levels = c("H.banksii_24", "H.banksii_26")
+)
+
+# reorder annotation
+ann_col <- ann_col %>% arrange(sample_group)
+
+# reorder heatmap matrix to match
+asv_mat_plot <- asv_mat_plot[, rownames(ann_col)]
+
+# 7) Colors similar to your example (dark low -> blue -> yellow -> red)
+heat_cols <- colorRampPalette(c("black", "#2C7BB6", "#FFFFBF", "#D7191C"))(100)
+
+# --- Italic genus labels (ComplexHeatmap expressions) ---
+row_labels <- tax_labs %>%
+  mutate(label = paste0(ASV_ID, "~~italic('", Genus, "')"))
+
+label_expr <- parse(text = row_labels$label)
+names(label_expr) <- row_labels$ASV_ID
+
+# Keep matrix rownames as ASV_ID for the row_labels mapping to work
+rownames(asv_mat_plot) <- row_labels$ASV_ID
+
+#Order columns by stage
+ann_col$stage <- factor(
+  ann_col$stage,
+  levels = c("adult","tetraspores", "eggs", "Stage_I","Stage_II","Stage_III", "Stage_IV", "Stage_V")
+)
+
+ann_col <- ann_col %>% arrange(stage)
+asv_mat_plot <- asv_mat_plot[, rownames(ann_col)]
+
+#Compute where stage groups change
+stage_lengths <- table(ann_col$stage)
+gaps_col <- cumsum(stage_lengths)
+gaps_col <- gaps_col[-length(gaps_col)]
+
+# 8A) pheatmap (numbers in tiles; genus NOT truly italic here)
+
+pdf("outputs/figures/ASV_heatmap_Hormosira.pdf", width = 13, height = 12)
+pheatmap(
+  asv_mat_plot,
+  name = "log10(% + 1e-6)",
+  color = heat_cols,
+  legend_breaks = legend_breaks,
+  legend_labels = legend_labels,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  treeheight_row = 0,
+  annotation_col = ann_col,
+  annotation_colors = ann_colors,
+   labels_row = label_expr,
+  gaps_col = gaps_col,
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  fontsize_row = 10,
+  fontsize_col = 10,
+  border_color = NA,
+  display_numbers = TRUE,
+  number_format = "%.1f",
+  main = ""
+)
+dev.off()
+
+```
+
+## NOW PLOT RELATIVE ABUNDACES WITH NO LOG TRANSFORMATION
+
+#HEATMAPS mvabund results
+
+#Ulva
+```{r}
+# ---- HEATMAP: Ulva + Seawater (REL ABUND %, gamma colours up to 90%, linear-looking legend) ----
+# 1) Select Ulva + Seawater samples
+# -----------------------------------------------------------
+meta_u_sw <- fact_cleaned_with_new_samples %>%
+  mutate(
+    sample_group = case_when(
+      sample_type == "U.australis_26" ~ "U. australis",
+      sample_type == "Seawater_26"    ~ "Seawater",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(sample_group)) %>%
+  distinct(sample_ID, .keep_all = TRUE)
+
+keep_samples <- meta_u_sw$sample_ID
+
+# -----------------------------------------------------------
+# 2) Build ASV count matrix
+# -----------------------------------------------------------
+asv_mat_counts <- ASV_abundance_table %>%
+  filter(ASV_ID %in% asvs_of_interest_Ulva) %>%
+  dplyr::select(ASV_ID, any_of(keep_samples)) %>%
+  column_to_rownames("ASV_ID") %>%
+  as.matrix()
+
+asv_mat_counts <- asv_mat_counts[, colnames(asv_mat_counts) %in% keep_samples, drop = FALSE]
+
+# -----------------------------------------------------------
+# 3) Convert to relative abundance (%)
+# -----------------------------------------------------------
+asv_mat_rel <- sweep(asv_mat_counts, 2, colSums(asv_mat_counts), FUN = "/")
+asv_mat_rel[!is.finite(asv_mat_rel)] <- 0
+
+asv_mat_plot <- asv_mat_rel * 100
+
+# -----------------------------------------------------------
+# 4) Colour mapping (gamma transform), capped at 90%
+# -----------------------------------------------------------
+cap_max <- 90
+gamma   <- 0.35
+
+asv_mat_for_scale <- pmin(asv_mat_plot, cap_max)
+
+asv_mat_col <- (asv_mat_for_scale / cap_max) ^ gamma
+asv_mat_col[asv_mat_for_scale == 0] <- NA
+
+#OLD n_steps <- 200
+#OLD heat_breaks <- seq(0, 1, length.out = n_steps + 1)
+#OLD heat_cols   <- colorRampPalette(c("#2C7BB6", "#FFFFBF", "#D7191C"))(n_steps)
+
+# Increase resolution (more smooth red gradient)
+n_colors <- 300   # <- increase this (e.g., 100 → 200 or 300)
+heat_breaks <- seq(min(asv_mat_col, na.rm = TRUE),
+                   max(asv_mat_col, na.rm = TRUE),
+                   length.out = n_colors + 1)
+heat_cols <- colorRampPalette(c(
+  "#2C7BB6",
+  "#ABD9E9",
+  "#FFFFBF",
+  "#FDAE61",
+  "#F46D43",
+  "#D73027",
+  "#A50026"
+))(n_colors)
+
+legend_vals   <- c(0, 0.01, 0.1, 0.5, 1, 2, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90)
+legend_vals   <- legend_vals[legend_vals <= cap_max]
+legend_breaks <- (legend_vals / cap_max) ^ gamma
+legend_labels <- paste0(legend_vals, "%")
+
+# -----------------------------------------------------------
+# 5) Row clustering on ORIGINAL % matrix
+# -----------------------------------------------------------
+row_hc <- hclust(dist(asv_mat_plot), method = "complete")
+
+# -----------------------------------------------------------
+# 6) Taxonomy row labels (italic genus)
+# -----------------------------------------------------------
+tax_labs <- ASV_taxonomy_table %>%
+  filter(ASV_ID %in% rownames(asv_mat_plot)) %>%
+  mutate(Genus = ifelse(is.na(Genus) | Genus == "", "Unclassified", Genus)) %>%
+  distinct(ASV_ID, Genus)
+
+row_labels <- tax_labs %>%
+  mutate(label = paste0(ASV_ID, "~~italic('", Genus, "')"))
+
+label_expr <- parse(text = row_labels$label)
+names(label_expr) <- row_labels$ASV_ID
+
+rownames(asv_mat_plot) <- row_labels$ASV_ID
+rownames(asv_mat_col)  <- row_labels$ASV_ID
+
+# -----------------------------------------------------------
+# 7) Column annotations
+# -----------------------------------------------------------
+ann_col <- meta_u_sw %>%
+  dplyr::select(sample_ID, stage) %>%
+  dplyr::distinct(sample_ID, .keep_all = TRUE) %>%
+  tibble::column_to_rownames("sample_ID") %>%
+  as.data.frame(stringsAsFactors = FALSE)
+
+ann_col <- ann_col[match(colnames(asv_mat_plot), rownames(ann_col)), , drop = FALSE]
+
+stopifnot(is.data.frame(ann_col))
+stopifnot("stage" %in% colnames(ann_col))
+
+ann_col$stage <- factor(
+  ann_col$stage,
+  levels = c("Stage_I", "Stage_II", "Stage_III", "Stage_IV", "Seawater_I/II", "Seawater_III/IV")
+)
+
+ann_col <- ann_col %>% arrange(stage)
+
+asv_mat_plot <- asv_mat_plot[, rownames(ann_col), drop = FALSE]
+asv_mat_col  <- asv_mat_col[,  rownames(ann_col), drop = FALSE]
+
+stage_lengths <- table(ann_col$stage)
+gaps_col <- cumsum(stage_lengths)
+gaps_col <- gaps_col[-length(gaps_col)]
+
+ann_colors <- list(
+  stage = c(
+   "adult"            = "#D81B60",
+"eggs"             = "#1E88E5",
+"tetraspores"      =   "#3949AB",
+"Seawater_I/II"    = "#D55E00",
+"Seawater_III/IV"  = "#C0CA33",
+"Stage_I"      = "#43A047",
+"Stage_II"    = "#FFC107",
+"Stage_III"  = "#6D4C41",
+"Stage_IV"          = "#8E24AA",
+"Stage_V"         = "#004D40"
+#,"XXX"        = "#D55E00",
+ # XXX"         = "#C0CA33",
+ # XXX"          = "#3949AB"
+  )
+)
+
+# -----------------------------------------------------------
+# 8) FINAL ALIGNMENT + numbers (same logic as Delisea/Hormosira)
+# -----------------------------------------------------------
+asv_mat_plot <- asv_mat_plot[rownames(asv_mat_col), colnames(asv_mat_col), drop = FALSE]
+
+num_mat <- ifelse(asv_mat_plot == 0, "", sprintf("%.2g", asv_mat_plot))
+
+stopifnot(identical(dim(num_mat), dim(asv_mat_col)))
+stopifnot(identical(rownames(num_mat), rownames(asv_mat_col)))
+stopifnot(identical(colnames(num_mat), colnames(asv_mat_col)))
+
+# -----------------------------------------------------------
+# 9) Plot
+# -----------------------------------------------------------
+pdf("outputs/figures/ASV_heatmap_Ulva_RelAbund_gamma_MATCHED.pdf",
+    width = 16, height = 12)
+
+pheatmap(
+  asv_mat_col,
+  name = "Relative abundance",
+
+  color  = heat_cols,
+  breaks = heat_breaks,
+  na_col = "black",
+
+  legend_breaks = legend_breaks,
+  legend_labels = legend_labels,
+
+  cluster_rows = row_hc,
+  cluster_cols = FALSE,
+  treeheight_row = 0,
+
+  annotation_col = ann_col,
+  annotation_colors = ann_colors,
+
+  labels_row = label_expr,
+  gaps_col = gaps_col,
+
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+
+  fontsize_row = 10,
+  fontsize_col = 10,
+  fontsize_number = 7,
+
+  border_color = NA,
+
+  display_numbers = num_mat,
+  number_color = "black",
+  number_format = "%.2g",
+
+  main = ""
+)
+
+dev.off()
+
+```
+
+```{r}
+# ---- ULVA HEATMAP WITH ONE MICROSCOPY IMAGE PER STAGE BLOCK ----
+# Run this AFTER your Ulva heatmap-prep chunk, so these objects already exist:
+#   asv_mat_col
+#   asv_mat_plot
+#   ann_col
+#   row_hc
+#   num_mat
+#   heat_cols
+#   heat_breaks
+#   legend_breaks
+#   legend_labels
+#   label_expr
+# 1) Define one PNG image per stage
+#    Use the REAL PNG files here
+# -----------------------------------------------------------
+stage_images <- c(
+  "Stage_I"         = "Figure_Scripts_Syukur/Figures/Developmental stages/Ulva/0_10x_7D_scale.png",
+  "Stage_II"        = "Figure_Scripts_Syukur/Figures/Developmental stages/Ulva/1_52D_scale_big.png",
+  "Stage_III"       = "Figure_Scripts_Syukur/Figures/Developmental stages/Ulva/2_Ulva_84D_scale.png",
+  "Stage_IV"        = "Figure_Scripts_Syukur/Figures/Developmental stages/Ulva/3_Ulva_117D_scale.png",
+  "Seawater_I/II"   = "Figure_Scripts_Syukur/Figures/Developmental stages/NSW.png",
+  "Seawater_III/IV" = "Figure_Scripts_Syukur/Figures/Developmental stages/NSW2.png"
+)
+
+# -----------------------------------------------------------
+# 2) Safety checks
+# -----------------------------------------------------------
+stopifnot(all(unique(as.character(ann_col$stage)) %in% names(stage_images)))
+stopifnot(all(file.exists(stage_images)))
+
+# read each stage image once
+stage_pngs <- lapply(stage_images, png::readPNG)
+
+# -----------------------------------------------------------
+# 3) Rebuild num_mat at the end so it stays aligned
+# -----------------------------------------------------------
+asv_mat_plot <- asv_mat_plot[rownames(asv_mat_col), colnames(asv_mat_col), drop = FALSE]
+num_mat <- ifelse(asv_mat_plot == 0, "", sprintf("%.2g", asv_mat_plot))
+
+stopifnot(identical(dim(num_mat), dim(asv_mat_col)))
+stopifnot(identical(rownames(num_mat), rownames(asv_mat_col)))
+stopifnot(identical(colnames(num_mat), colnames(asv_mat_col)))
+
+# -----------------------------------------------------------
+# 4) Build a colour function from your existing pheatmap palette
+#    asv_mat_col is already on the transformed 0..1 scale
+# -----------------------------------------------------------
+col_fun <- circlize::colorRamp2(
+  seq(0, 1, length.out = length(heat_cols)),
+  heat_cols
+)
+
+# -----------------------------------------------------------
+# 5) Top annotation:
+#    - one image per stage block (anno_block)
+#    - optional stage colour bar underneath (same ann_colors as before)
+# -----------------------------------------------------------
+ha_top <- HeatmapAnnotation(
+  microscopy = anno_block(
+    gp = gpar(col = "black", fill = NA),
+    height = unit(2.6, "cm"),
+    panel_fun = function(index, level) {
+      stage_name <- as.character(level)
+      img <- stage_pngs[[stage_name]]
+      grid.raster(img, x = 0.5, y = 0.5, width = unit(0.95, "npc"), height = unit(0.9, "npc"))
+    }
+  ),
+  stage = ann_col$stage,
+  col = list(stage = ann_colors$stage),
+  annotation_name_side = "left"
+)
+
+# -----------------------------------------------------------
+# 6) Draw heatmap
+#    This mimics your pheatmap settings as closely as possible
+# -----------------------------------------------------------
+ht <- Heatmap(
+  asv_mat_col,
+  name = "Relative abundance",
+  col = col_fun,
+  na_col = "black",
+
+  # same clustering idea as pheatmap
+  cluster_rows = row_hc,
+  cluster_columns = FALSE,
+  row_dend_width = unit(0, "mm"),   # like treeheight_row = 0
+
+  # split columns by stage -> replaces pheatmap gaps_col visually
+  column_split = ann_col$stage,
+  column_gap = unit(2, "mm"),
+
+  # row labels
+  row_labels = label_expr,
+  show_row_names = TRUE,
+  show_column_names = FALSE,
+
+  row_names_gp = gpar(fontsize = 10),
+  column_names_gp = gpar(fontsize = 10),
+
+  # no borders
+  rect_gp = gpar(col = NA),
+
+  # top annotations
+  top_annotation = ha_top,
+
+  # numbers inside cells (same idea as display_numbers)
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    lab <- num_mat[i, j]
+    if (lab != "") {
+      grid.text(
+        lab, x = x, y = y,
+        gp = gpar(fontsize = 7, col = "black")
+      )
+    }
+  },
+
+  # legend
+  heatmap_legend_param = list(
+    at = legend_breaks,
+    labels = legend_labels,
+    title = "Relative abundance"
+  )
+)
+
+pdf("outputs/figures/ASV_heatmap_Ulva_stageMicroscopy_oncePerStage.pdf",
+    width = 16, height = 14)
+
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right"
+)
+
+dev.off()
+```
+
+#Delisea
+```{r}
+# ---- HEATMAP: Delisea (REL ABUND %, gamma colours up to 90%, linear-looking legend) ----
+# Fixes included:
+#  ✅ colours come from gamma-transformed matrix (more warm colours for low values)
+#  ✅ legend tick labels stay in % (0–100)
+#  ✅ zeros plotted black (NA in colour matrix only)
+#  ✅ numbers NEVER mismatch colours (num_mat created at the VERY END after all reordering)
+#  ✅ avoids "red cell with 0.0" misalignment bug
+#  ✅ annotation data.frame is bulletproof (never becomes vector)
+# 1) Select Delisea samples
+# -----------------------------------------------------------
+meta_dp <- fact_cleaned_with_new_samples %>%
+  mutate(
+    sample_group = case_when(
+      sample_type %in% c("D.pulchra_24", "D.pulchra_26") ~ "D.pulchra",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(sample_group)) %>%
+  distinct(sample_ID, .keep_all = TRUE)
+
+keep_samples <- meta_dp$sample_ID
+
+# -----------------------------------------------------------
+# 2) Build ASV count matrix
+# -----------------------------------------------------------
+asv_mat_counts <- ASV_abundance_table %>%
+  filter(ASV_ID %in% asvs_of_interest_Delisea) %>%
+  dplyr::select(ASV_ID, any_of(keep_samples)) %>%
+  column_to_rownames("ASV_ID") %>%
+  as.matrix()
+
+# keep only columns that exist
+asv_mat_counts <- asv_mat_counts[, colnames(asv_mat_counts) %in% keep_samples, drop = FALSE]
+
+# -----------------------------------------------------------
+# 3) Convert to relative abundance (%) - raw values used for numbers + clustering
+# -----------------------------------------------------------
+asv_mat_rel <- sweep(asv_mat_counts, 2, colSums(asv_mat_counts), FUN = "/")
+asv_mat_rel[!is.finite(asv_mat_rel)] <- 0
+
+asv_mat_plot <- asv_mat_rel * 100
+
+# (Optional sanity check; should be ~1 for each sample)
+# print(colSums(asv_mat_rel))
+
+# -----------------------------------------------------------
+# 4) Colour mapping (gamma transform), capped at 90%
+#    NOTE: this only affects colours, NOT the printed numbers.
+# -----------------------------------------------------------
+cap_max <- 90
+gamma   <- 0.35  # lower -> more warm colours for small values (try 0.25–0.5)
+
+# Clamp ONLY for colouring
+asv_mat_for_scale <- pmin(asv_mat_plot, cap_max)
+
+# Gamma transform to 0..1 for colour mapping
+asv_mat_col <- (asv_mat_for_scale / cap_max) ^ gamma
+
+# Zeros plotted as black by setting them NA in the colour matrix
+asv_mat_col[asv_mat_for_scale == 0] <- NA
+
+# OLD:
+# Smooth gradient (0..1)
+# n_steps <- 200
+# heat_breaks <- seq(0, 1, length.out = n_steps + 1)
+# heat_cols   <- colorRampPalette(c("#2C7BB6", "#FFFFBF", "#D7191C"))(n_steps)
+
+# Increase resolution (more smooth red gradient)
+n_colors <- 300   # <- increase this (e.g., 100 → 200 or 300)
+heat_breaks <- seq(min(asv_mat_col, na.rm = TRUE),
+                   max(asv_mat_col, na.rm = TRUE),
+                   length.out = n_colors + 1)
+heat_cols <- colorRampPalette(c(
+  "#2C7BB6",
+  "#ABD9E9",
+  "#FFFFBF",
+  "#FDAE61",
+  "#F46D43",
+  "#D73027",
+  "#A50026"
+))(n_colors)
+
+# Legend ticks: show in % but place them correctly on the transformed (0..1) axis
+legend_vals   <- c(0, 0.01, 0.1, 0.5, 1, 2, 5, 10, 20, 30, 40, 50,60,70, 80, 90)
+legend_vals   <- legend_vals[legend_vals <= cap_max]
+legend_breaks <- (legend_vals / cap_max) ^ gamma
+legend_labels <- paste0(legend_vals, "%")
+
+# -----------------------------------------------------------
+# 5) Row clustering on ORIGINAL % matrix (not transformed / NA)
+# -----------------------------------------------------------
+row_hc <- hclust(dist(asv_mat_plot), method = "complete")
+
+# -----------------------------------------------------------
+# 6) Taxonomy row labels (italic genus)
+# -----------------------------------------------------------
+tax_labs <- ASV_taxonomy_table %>%
+  filter(ASV_ID %in% rownames(asv_mat_plot)) %>%
+  mutate(Genus = ifelse(is.na(Genus) | Genus == "", "Unclassified", Genus)) %>%
+  distinct(ASV_ID, Genus)
+
+row_labels <- tax_labs %>%
+  mutate(label = paste0(ASV_ID, "~~italic('", Genus, "')"))
+
+label_expr <- parse(text = row_labels$label)
+names(label_expr) <- row_labels$ASV_ID
+
+# Keep rownames as ASV_ID so row label mapping works
+rownames(asv_mat_plot) <- row_labels$ASV_ID
+rownames(asv_mat_col)  <- row_labels$ASV_ID
+
+# -----------------------------------------------------------
+# 7) Column annotations (BULLETPROOF data.frame)
+# -----------------------------------------------------------
+ann_col <- meta_dp %>%
+  dplyr::select(sample_ID, stage) %>%
+  dplyr::distinct(sample_ID, .keep_all = TRUE) %>%
+  tibble::column_to_rownames("sample_ID") %>%
+  as.data.frame(stringsAsFactors = FALSE)
+
+# Reorder to match matrix columns (never drops)
+ann_col <- ann_col[match(colnames(asv_mat_plot), rownames(ann_col)), , drop = FALSE]
+
+stopifnot(is.data.frame(ann_col))
+stopifnot("stage" %in% colnames(ann_col))
+
+# Stage order (adjust levels to your dataset)
+ann_col$stage <- factor(
+  ann_col$stage,
+  levels = c("adult", "tetraspores", "Stage_I", "Stage_II", "Stage_III")
+)
+
+ann_col <- ann_col %>% arrange(stage)
+
+# Reorder BOTH matrices to match stage order
+asv_mat_plot <- asv_mat_plot[, rownames(ann_col), drop = FALSE]
+asv_mat_col  <- asv_mat_col[,  rownames(ann_col), drop = FALSE]
+
+# gaps between stage blocks
+stage_lengths <- table(ann_col$stage)
+gaps_col <- cumsum(stage_lengths)
+gaps_col <- gaps_col[-length(gaps_col)]
+
+# Annotation colours (only stage used here)
+ann_colors <- list(
+  stage = c(
+   "adult"            = "#D81B60",
+"eggs"             = "#1E88E5",
+"tetraspores"      =   "#3949AB",
+"Seawater_I/II"    = "#D55E00",
+"Seawater_III/IV"  = "#C0CA33",
+"Stage_I"      = "#43A047",
+"Stage_II"    = "#FFC107",
+"Stage_III"  = "#6D4C41",
+"Stage_IV"          = "#8E24AA",
+"Stage_V"         = "#004D40"
+#,"XXX"        = "#D55E00",
+ # XXX"         = "#C0CA33",
+ # XXX"          = "#3949AB"
+  )
+)
+
+# -----------------------------------------------------------
+# 8) FINAL ALIGNMENT + numbers (CRITICAL)
+#    Build num_mat ONLY after all reordering, and align to asv_mat_col
+# -----------------------------------------------------------
+asv_mat_plot <- asv_mat_plot[rownames(asv_mat_col), colnames(asv_mat_col), drop = FALSE]
+
+# Two options:
+# A) hide zeros:
+num_mat <- ifelse(asv_mat_plot == 0, "", sprintf("%.2g", asv_mat_plot))
+# B) if you truly want to display zeros, use:
+# num_mat <- sprintf("%.1f", asv_mat_plot)
+
+# sanity checks: prevent "red tile with 0.0" mismatch
+stopifnot(identical(dim(num_mat), dim(asv_mat_col)))
+stopifnot(identical(rownames(num_mat), rownames(asv_mat_col)))
+stopifnot(identical(colnames(num_mat), colnames(asv_mat_col)))
+
+# Blank column labels (prevents numeric colnames appearing at top)
+blank_col_labels <- rep("", ncol(asv_mat_col))
+
+# -----------------------------------------------------------
+# 9) Plot
+# -----------------------------------------------------------
+pdf("outputs/figures/ASV_heatmap_Delisea_RelAbund_gamma_FIXED.pdf",
+    width = 14, height = 12)
+
+pheatmap(
+  asv_mat_col,
+  name = "Relative abundance",
+
+  color  = heat_cols,
+  breaks = heat_breaks,
+  na_col = "black",
+
+  legend_breaks = legend_breaks,
+  legend_labels = legend_labels,
+
+  cluster_rows = row_hc,
+  cluster_cols = FALSE,
+  treeheight_row = 0,
+
+  annotation_col = ann_col,
+  annotation_colors = ann_colors,
+
+  labels_row = label_expr,
+  labels_col = blank_col_labels,
+  gaps_col = gaps_col,
+
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+
+  fontsize_row = 10,
+  fontsize_col = 10,
+  fontsize_number = 7,     # helps numbers show
+
+  border_color = NA,
+
+  display_numbers = num_mat,
+  number_color = "black",  # better visibility on dark tiles
+  number_format = "%.2g",
+
+  main = ""
+)
+
+dev.off()
+
+```
+
+```{r}
+
+# ---- DELISEA HEATMAP WITH ONE MICROSCOPY IMAGE PER STAGE BLOCK ----
+# Run this AFTER your Delisea heatmap-prep chunk, so these objects already exist:
+#   asv_mat_col
+#   asv_mat_plot
+#   ann_col
+#   row_hc
+#   num_mat
+#   heat_cols
+#   heat_breaks
+#   legend_breaks
+#   legend_labels
+#   label_expr
+#   ann_colors
+# 1) Define one PNG image per stage
+#    Use the REAL PNG files here
+# -----------------------------------------------------------
+stage_images <- c(
+  "adult"       = "Figure_Scripts_Syukur/Figures/Developmental stages/Delisea/0_Delisea_Adult.jpeg",
+  "tetraspores" = "Figure_Scripts_Syukur/Figures/Developmental stages/Delisea/1_Delisea_tetraspores4_40x (2x).png",
+  "Stage_I"     = "Figure_Scripts_Syukur/Figures/Developmental stages/Delisea/2_7D scale.png",
+  "Stage_II"    = "Figure_Scripts_Syukur/Figures/Developmental stages/Delisea/3_52D SCALE.png",
+  "Stage_III"   = "Figure_Scripts_Syukur/Figures/Developmental stages/Delisea/4_84D scale Del_1_10.1.png"
+)
+
+# -----------------------------------------------------------
+# 2) Safety checks
+# -----------------------------------------------------------
+stopifnot(all(unique(as.character(ann_col$stage)) %in% names(stage_images)))
+stopifnot(all(file.exists(stage_images)))
+stage_pngs <- lapply(stage_images, function(x){
+  as.raster(image_read(x))
+})
+
+# -----------------------------------------------------------
+# 3) Standardise all microscopy images onto the same large canvas
+#    - preserves aspect ratio
+#    - avoids stretching
+#    - keeps resolution high even if stage blocks have different widths
+# -----------------------------------------------------------
+canvas_width  <- 3000
+canvas_height <- 2200
+
+standardise_image <- function(path, canvas_width = 3000, canvas_height = 2200, bg = "white") {
+  img <- magick::image_read(path)
+
+  info  <- magick::image_info(img)
+  img_w <- info$width[1]
+  img_h <- info$height[1]
+
+  # fit inside fixed canvas without distortion
+  scale_factor <- min(canvas_width / img_w, canvas_height / img_h)
+  new_w <- max(1, round(img_w * scale_factor))
+  new_h <- max(1, round(img_h * scale_factor))
+
+  # resize proportionally
+  img_resized <- magick::image_resize(img, paste0(new_w, "x", new_h))
+
+  # place on fixed canvas, centered
+  img_final <- magick::image_extent(
+    img_resized,
+    geometry = paste0(canvas_width, "x", canvas_height),
+    gravity  = "center",
+    color    = bg
+  )
+
+  as.raster(img_final)
+}
+
+stage_pngs <- lapply(
+  stage_images,
+  standardise_image,
+  canvas_width = canvas_width,
+  canvas_height = canvas_height,
+  bg = "white"
+)
+
+# -----------------------------------------------------------
+# 4) Rebuild num_mat at the end so it stays aligned
+# -----------------------------------------------------------
+asv_mat_plot <- asv_mat_plot[rownames(asv_mat_col), colnames(asv_mat_col), drop = FALSE]
+num_mat <- ifelse(asv_mat_plot == 0, "", sprintf("%.2g", asv_mat_plot))
+
+stopifnot(identical(dim(num_mat), dim(asv_mat_col)))
+stopifnot(identical(rownames(num_mat), rownames(asv_mat_col)))
+stopifnot(identical(colnames(num_mat), colnames(asv_mat_col)))
+
+# -----------------------------------------------------------
+# 5) Build colour function from your existing palette
+#    asv_mat_col is already on the transformed 0..1 scale
+# -----------------------------------------------------------
+col_fun <- circlize::colorRamp2(
+  seq(0, 1, length.out = length(heat_cols)),
+  heat_cols
+)
+
+# -----------------------------------------------------------
+# 6) Top annotation:
+#    - one image per stage block
+#    - stage colour bar underneath
+# -----------------------------------------------------------
+ha_top <- HeatmapAnnotation(
+  microscopy = anno_block(
+    gp = gpar(col = "black", fill = NA),
+    height = unit(2.8, "cm"),
+    panel_fun = function(index, level) {
+      stage_name <- as.character(level)
+      img <- stage_pngs[[stage_name]]
+
+      grid.raster(
+        img,
+        x = 0.5, y = 0.5,
+        width = unit(0.98, "npc"),
+        height = unit(0.95, "npc"),
+        interpolate = TRUE
+      )
+    }
+  ),
+  stage = ann_col$stage,
+  col = list(stage = ann_colors$stage),
+  annotation_name_side = "left"
+)
+
+# -----------------------------------------------------------
+# 7) Draw heatmap
+# -----------------------------------------------------------
+ht <- Heatmap(
+  asv_mat_col,
+  name = "Relative abundance",
+  col = col_fun,
+  na_col = "black",
+
+  # same clustering idea as before
+  cluster_rows = row_hc,
+  cluster_columns = FALSE,
+  row_dend_width = unit(0, "mm"),
+
+  # split columns by stage
+  column_split = ann_col$stage,
+  column_gap = unit(2, "mm"),
+
+  # labels
+  row_labels = label_expr,
+  show_row_names = TRUE,
+  show_column_names = FALSE,
+
+  row_names_gp = gpar(fontsize = 10),
+  column_names_gp = gpar(fontsize = 10),
+
+  # no tile borders
+  rect_gp = gpar(col = NA),
+
+  # top microscopy annotation
+  top_annotation = ha_top,
+
+  # numbers inside cells
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    lab <- num_mat[i, j]
+    if (lab != "") {
+      grid.text(
+        lab, x = x, y = y,
+        gp = gpar(fontsize = 7, col = "black")
+      )
+    }
+  },
+
+  # legend
+  heatmap_legend_param = list(
+    at = legend_breaks,
+    labels = legend_labels,
+    title = "Relative abundance"
+  )
+)
+
+pdf(
+  "outputs/figures/ASV_heatmap_Delisea_stageMicroscopy_oncePerStage.pdf",
+  width = 14, height = 12
+)
+
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right"
+)
+
+dev.off()
+
+```
+
+```{r}
+# ---- HEATMAP: Hormosira (REL ABUND %, gamma colours up to 90%, linear-looking legend) ----
+# Same approach as Delisea:
+#  ✅ colours from gamma-transformed matrix (more warm colours for low values)
+#  ✅ legend tick labels in % (0–90 positioned correctly in transformed space
+#  ✅ zeros plotted black (NA in colour matrix only)
+#  ✅ numbers NEVER mismatch colours (num_mat created at the VERY END after all reordering)
+#  ✅ annotation data.frame is bulletproof (never becomes vector)
+# 1) Select Hormosira samples (H.banksii_24 + H.banksii_26)
+# -----------------------------------------------------------
+meta_hb <- fact_cleaned_with_new_samples %>%
+  mutate(
+    sample_group = case_when(
+      sample_type %in% c("H.banksii_24", "H.banksii_26") ~ "H.banksii",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(sample_group)) %>%
+  distinct(sample_ID, .keep_all = TRUE)
+
+keep_samples <- meta_hb$sample_ID
+
+# -----------------------------------------------------------
+# 2) Build ASV count matrix
+# -----------------------------------------------------------
+asv_mat_counts <- ASV_abundance_table %>%
+  filter(ASV_ID %in% asvs_of_interest_Hormosira) %>%   # <-- your Hormosira ASV vector
+  dplyr::select(ASV_ID, any_of(keep_samples)) %>%
+  column_to_rownames("ASV_ID") %>%
+  as.matrix()
+
+asv_mat_counts <- asv_mat_counts[, colnames(asv_mat_counts) %in% keep_samples, drop = FALSE]
+
+# -----------------------------------------------------------
+# 3) Convert to relative abundance (%) - raw values for numbers + clustering
+# -----------------------------------------------------------
+asv_mat_rel <- sweep(asv_mat_counts, 2, colSums(asv_mat_counts), FUN = "/")
+asv_mat_rel[!is.finite(asv_mat_rel)] <- 0
+
+asv_mat_plot <- asv_mat_rel * 100
+
+# -----------------------------------------------------------
+# 4) Colour mapping (gamma transform), capped at 50%
+# -----------------------------------------------------------
+cap_max <- 90
+gamma   <- 0.35  # lower -> more warm colours for small values (try 0.25–0.5)
+
+asv_mat_for_scale <- pmin(asv_mat_plot, cap_max)
+
+asv_mat_col <- (asv_mat_for_scale / cap_max) ^ gamma
+asv_mat_col[asv_mat_for_scale == 0] <- NA
+
+#OLD:
+# n_steps <- 200
+# heat_breaks <- seq(0, 1, length.out = n_steps + 1)
+# heat_cols   <- colorRampPalette(c("#2C7BB6", "#FFFFBF", "#D7191C"))(n_steps)
+
+# Increase resolution (more smooth red gradient)
+n_colors <- 300   # <- increase this (e.g., 100 → 200 or 300)
+heat_breaks <- seq(min(asv_mat_col, na.rm = TRUE),
+                   max(asv_mat_col, na.rm = TRUE),
+                   length.out = n_colors + 1)
+heat_cols <- colorRampPalette(c(
+  "#2C7BB6",
+  "#ABD9E9",
+  "#FFFFBF",
+  "#FDAE61",
+  "#F46D43",
+  "#D73027",
+  "#A50026"
+))(n_colors)
+
+legend_vals   <- c(0, 0.01, 0.1, 0.5, 1, 2, 5, 10, 20, 30, 40, 50,60,70, 80, 90)
+legend_vals   <- legend_vals[legend_vals <= cap_max]
+legend_breaks <- (legend_vals / cap_max) ^ gamma
+legend_labels <- paste0(legend_vals, "%")
+
+# -----------------------------------------------------------
+# 5) Row clustering on ORIGINAL % matrix
+# -----------------------------------------------------------
+row_hc <- hclust(dist(asv_mat_plot), method = "complete")
+
+# -----------------------------------------------------------
+# 6) Taxonomy row labels (italic genus)
+# -----------------------------------------------------------
+tax_labs <- ASV_taxonomy_table %>%
+  filter(ASV_ID %in% rownames(asv_mat_plot)) %>%
+  mutate(Genus = ifelse(is.na(Genus) | Genus == "", "Unclassified", Genus)) %>%
+  distinct(ASV_ID, Genus)
+
+row_labels <- tax_labs %>%
+  mutate(label = paste0(ASV_ID, "~~italic('", Genus, "')"))
+
+label_expr <- parse(text = row_labels$label)
+names(label_expr) <- row_labels$ASV_ID
+
+rownames(asv_mat_plot) <- row_labels$ASV_ID
+rownames(asv_mat_col)  <- row_labels$ASV_ID
+
+# -----------------------------------------------------------
+# 7) Column annotations (BULLETPROOF data.frame)
+# -----------------------------------------------------------
+ann_col <- meta_hb %>%
+  dplyr::select(sample_ID, stage) %>%
+  dplyr::distinct(sample_ID, .keep_all = TRUE) %>%
+  tibble::column_to_rownames("sample_ID") %>%
+  as.data.frame(stringsAsFactors = FALSE)
+
+ann_col <- ann_col[match(colnames(asv_mat_plot), rownames(ann_col)), , drop = FALSE]
+
+stopifnot(is.data.frame(ann_col))
+stopifnot("stage" %in% colnames(ann_col))
+
+# Set your desired stage order for Hormosira
+ann_col$stage <- factor(
+  ann_col$stage,
+  levels = c("adult","eggs","Stage_I","Stage_II","Stage_III","Stage_IV","Stage_V")
+)
+
+ann_col <- ann_col %>% arrange(stage)
+
+# Reorder BOTH matrices to match stage order
+asv_mat_plot <- asv_mat_plot[, rownames(ann_col), drop = FALSE]
+asv_mat_col  <- asv_mat_col[,  rownames(ann_col), drop = FALSE]
+
+# gaps between stage blocks
+stage_lengths <- table(ann_col$stage)
+gaps_col <- cumsum(stage_lengths)
+gaps_col <- gaps_col[-length(gaps_col)]
+
+# Annotation colours (stage)
+ann_colors <- list(
+  stage = c(
+"adult"            = "#D81B60",
+"eggs"             = "#1E88E5",
+"tetraspores"      =   "#3949AB",
+"Seawater_I/II"    = "#D55E00",
+"Seawater_III/IV"  = "#C0CA33",
+"Stage_I"      = "#43A047",
+"Stage_II"    = "#FFC107",
+"Stage_III"  = "#6D4C41",
+"Stage_IV"          = "#8E24AA",
+"Stage_V"         = "#004D40"
+#,"XXX"        = "#D55E00",
+ # XXX"         = "#C0CA33",
+ # XXX"          = "#3949AB"
+  )
+)
+
+# -----------------------------------------------------------
+# 8) FINAL ALIGNMENT + numbers (CRITICAL)
+# -----------------------------------------------------------
+asv_mat_plot <- asv_mat_plot[rownames(asv_mat_col), colnames(asv_mat_col), drop = FALSE]
+
+# Hide zeros; show 1 decimal
+num_mat <- ifelse(asv_mat_plot == 0, "", sprintf("%.2g", asv_mat_plot))
+
+# 
+stopifnot(identical(dim(num_mat), dim(asv_mat_col)))
+stopifnot(identical(rownames(num_mat), rownames(asv_mat_col)))
+stopifnot(identical(colnames(num_mat), colnames(asv_mat_col)))
+
+# Blank column labels (prevents numeric colnames appearing at top)
+blank_col_labels <- rep("", ncol(asv_mat_col))
+
+# -----------------------------------------------------------
+# 9) Plot
+# -----------------------------------------------------------
+pdf("outputs/figures/ASV_heatmap_Hormosira_RelAbund_gamma_FIXED.pdf",
+    width = 14, height = 12)
+
+pheatmap(
+  asv_mat_col,
+  name = "Relative abundance",
+
+  color  = heat_cols,
+  breaks = heat_breaks,
+  na_col = "black",
+
+  legend_breaks = legend_breaks,
+  legend_labels = legend_labels,
+
+  cluster_rows = row_hc,
+  cluster_cols = FALSE,
+  treeheight_row = 0,
+
+  annotation_col = ann_col,
+  annotation_colors = ann_colors,
+
+  labels_row = label_expr,
+  labels_col = blank_col_labels,
+  gaps_col = gaps_col,
+
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+
+  fontsize_row = 10,
+  fontsize_col = 10,
+  fontsize_number = 7,
+
+  border_color = NA,
+
+  display_numbers = num_mat,
+  number_color = "black",
+  number_format = "%.2g",
+
+  main = ""
+)
+
+dev.off()
+
+```
+
+```{r}
+# ---- ADD STAGE MICROSCOPY IMAGES ABOVE HORMOSIRA HEATMAP (one image per stage block) ----
+# Run this AFTER your Hormosira heatmap-prep chunk, so these objects already exist:
+#   asv_mat_col
+#   asv_mat_plot
+#   ann_col
+#   row_hc
+#   num_mat
+#   heat_cols
+#   legend_breaks
+#   legend_labels
+#   label_expr
+#   ann_colors
+# 1) Define one microscopy image per stage
+# -----------------------------------------------------------
+stage_images <- c(
+  "eggs" = "Figure_Scripts_Syukur/Figures/Developmental stages/Hormosira/0_Hormosira_Eggs.tif",
+  "adult"       = "Figure_Scripts_Syukur/Figures/Developmental stages/Hormosira/1_HormosiraAdult.JPG",
+  "Stage_I"     = "Figure_Scripts_Syukur/Figures/Developmental stages/Hormosira/2_24H_20.tif",
+  "Stage_II"    = "Figure_Scripts_Syukur/Figures/Developmental stages/Hormosira/3_7D_10x.tif",
+  "Stage_III"   = "Figure_Scripts_Syukur/Figures/Developmental stages/Hormosira/4_16D.tif",
+  "Stage_IV"    = "Figure_Scripts_Syukur/Figures/Developmental stages/Hormosira/5_52D.tif",
+  "Stage_V"     = "Figure_Scripts_Syukur/Figures/Developmental stages/Hormosira/6_84D.tif"
+)
+
+# -----------------------------------------------------------
+# 2) Safety checks
+# -----------------------------------------------------------
+stopifnot(all(unique(as.character(ann_col$stage)) %in% names(stage_images)))
+stopifnot(all(file.exists(stage_images)))
+
+# -----------------------------------------------------------
+# 3) Standardise all microscopy images onto the same large canvas
+#    - preserves aspect ratio
+#    - avoids stretching
+#    - keeps resolution high
+# -----------------------------------------------------------
+canvas_width  <- 3000
+canvas_height <- 2200
+
+standardise_image <- function(path, canvas_width = 3000, canvas_height = 2200, bg = "white") {
+  img <- magick::image_read(path)
+
+  info  <- magick::image_info(img)
+  img_w <- info$width[1]
+  img_h <- info$height[1]
+
+  scale_factor <- min(canvas_width / img_w, canvas_height / img_h)
+  new_w <- max(1, round(img_w * scale_factor))
+  new_h <- max(1, round(img_h * scale_factor))
+
+  img_resized <- magick::image_resize(img, paste0(new_w, "x", new_h))
+
+  img_final <- magick::image_extent(
+    img_resized,
+    geometry = paste0(canvas_width, "x", canvas_height),
+    gravity  = "center",
+    color    = bg
+  )
+
+  as.raster(img_final)
+}
+
+stage_pngs <- lapply(
+  stage_images,
+  standardise_image,
+  canvas_width = canvas_width,
+  canvas_height = canvas_height,
+  bg = "white"
+)
+
+# -----------------------------------------------------------
+# 4) Rebuild num_mat at the end so it stays aligned
+# -----------------------------------------------------------
+asv_mat_plot <- asv_mat_plot[rownames(asv_mat_col), colnames(asv_mat_col), drop = FALSE]
+num_mat <- ifelse(asv_mat_plot == 0, "", sprintf("%.2g", asv_mat_plot))
+
+stopifnot(identical(dim(num_mat), dim(asv_mat_col)))
+stopifnot(identical(rownames(num_mat), rownames(asv_mat_col)))
+stopifnot(identical(colnames(num_mat), colnames(asv_mat_col)))
+
+# -----------------------------------------------------------
+# 5) Build a colour function from your existing palette
+# -----------------------------------------------------------
+col_fun <- circlize::colorRamp2(
+  seq(0, 1, length.out = length(heat_cols)),
+  heat_cols
+)
+
+# -----------------------------------------------------------
+# 6) Top annotation:
+#    - one image per stage block
+#    - stage colour bar underneath
+# -----------------------------------------------------------
+ha_top <- HeatmapAnnotation(
+  microscopy = anno_block(
+    gp = gpar(col = "black", fill = NA),
+    height = unit(2.8, "cm"),
+    panel_fun = function(index, level) {
+      stage_name <- as.character(level)
+      img <- stage_pngs[[stage_name]]
+
+      grid.raster(
+        img,
+        x = 0.5, y = 0.5,
+        width = unit(0.98, "npc"),
+        height = unit(0.95, "npc"),
+        interpolate = TRUE
+      )
+    }
+  ),
+  stage = ann_col$stage,
+  col = list(stage = ann_colors$stage),
+  annotation_name_side = "left"
+)
+
+# -----------------------------------------------------------
+# 7) Draw heatmap
+# -----------------------------------------------------------
+ht <- Heatmap(
+  asv_mat_col,
+  name = "Relative abundance",
+  col = col_fun,
+  na_col = "black",
+
+  cluster_rows = row_hc,
+  cluster_columns = FALSE,
+  row_dend_width = unit(0, "mm"),
+
+  column_split = ann_col$stage,
+  column_gap = unit(2, "mm"),
+
+  row_labels = label_expr,
+  show_row_names = TRUE,
+  show_column_names = FALSE,
+
+  row_names_gp = gpar(fontsize = 10),
+  column_names_gp = gpar(fontsize = 10),
+
+  rect_gp = gpar(col = NA),
+
+  top_annotation = ha_top,
+
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    lab <- num_mat[i, j]
+    if (lab != "") {
+      grid.text(
+        lab, x = x, y = y,
+        gp = gpar(fontsize = 7, col = "black")
+      )
+    }
+  },
+
+  heatmap_legend_param = list(
+    at = legend_breaks,
+    labels = legend_labels,
+    title = "Relative abundance"
+  )
+)
+
+pdf("outputs/figures/ASV_heatmap_Hormosira_stageMicroscopy_oncePerStage.pdf",
+    width = 16, height = 12)
+
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right"
+)
+
+dev.off()
+
+```
+
+## FIGURES for PAPER Alpha and PCOA plots
+
+```{r}
+# =========================================================
+# COMBINE 3 alpha-diversity plots + 3 PCoA plots
+# into one multi-panel figure
+# - patchwork adds A/B/C automatically
+# - no separate label column
+# - species names shown as italic alpha-plot titles
+# - final output: PNG and PDF
+# =========================================================
+outfile_pdf <- "outputs/figures/Combined_alpha_PCoA_figure.pdf"
+
+# alpha: no titles
+p_alpha_U2 <- p_alpha_U +
+  theme(
+    plot.title = element_blank(),
+    plot.margin = margin(2, 2, 2, 2),
+    legend.box.margin = margin(0, 0, 0, 0)
+  )
+
+p_alpha_H2 <- p_alpha_H +
+  theme(
+    plot.title = element_blank(),
+    plot.margin = margin(2, 2, 2, 2),
+    legend.box.margin = margin(0, 0, 0, 0)
+  )
+
+p_alpha_D2 <- p_alpha_D +
+  theme(
+    plot.title = element_blank(),
+    plot.margin = margin(2, 2, 2, 2),
+    legend.box.margin = margin(0, 0, 0, 0)
+  )
+
+# PCoA: tight margins
+pA_ait2 <- pA_ait_notitle +
+  theme(
+    plot.margin = margin(2, 2, 2, 2),
+    legend.box.margin = margin(0, 0, 0, 0)
+  )
+
+pB_ait2 <- pB_ait_notitle +
+  theme(
+    plot.margin = margin(2, 2, 2, 2),
+    legend.box.margin = margin(0, 0, 0, 0)
+  )
+
+pC_ait2 <- pC_ait_notitle +
+  theme(
+    plot.margin = margin(2, 2, 2, 2),
+    legend.box.margin = margin(0, 0, 0, 0)
+  )
+
+# rows
+row_A <- p_alpha_U2 + pA_ait2 + plot_layout(widths = c(2.25, 1))
+row_B <- p_alpha_H2 + pB_ait2 + plot_layout(widths = c(2.25, 1))
+row_C <- p_alpha_D2 + pC_ait2 + plot_layout(widths = c(2.25, 1))
+
+# row_A <- p_alpha_U2 + pA_ait2 + plot_layout(widths = c(1.25, 1))
+# row_B <- p_alpha_H2 + pB_ait2 + plot_layout(widths = c(1.25, 1))
+# row_C <- p_alpha_D2 + pC_ait2 + plot_layout(widths = c(1.25, 1))
+
+# final
+final_plot <- (row_A / row_B / row_C) +
+  plot_annotation(
+    tag_levels = "A",
+    theme = theme(
+      plot.tag = element_text(face = "bold", size = 16),
+      plot.tag.position = c(0.01, 0.98)
+    )
+  ) &
+  theme(
+    plot.margin = margin(0, 0, 0, 0)
+  )
+
+# ggsave(
+#   filename = outfile_pdf,
+#   plot = final_plot,
+#   width = 15,
+#   height = 14,
+#   bg = "white"
+#)
+
+final_plot
+
+```
+
+## Check relative abindance of target ASVs
+```{r}
+# ===============================
+# RELATIVE ABUNDANCE OF SELECTED ASVs
+# ===============================
+# 1) Define ASVs of interest
+# -------------------------------
+target_asvs <- c("ASV169", "ASV23", "ASV24", "ASV11", "ASV28")
+
+# Check they exist in your dataset
+if (!all(target_asvs %in% rownames(asv_abund_final_clean))) {
+  stop("Some ASVs not found in the ASV table")
+}
+
+# -------------------------------
+# 2) Convert counts to relative abundance (%)
+#    Each sample sums to 100%
+# -------------------------------
+rel_abund <- sweep(
+  asv_abund_final_clean,
+  2,
+  colSums(asv_abund_final_clean),
+  FUN = "/"
+) * 100
+
+# -------------------------------
+# 3) Sum selected ASVs per sample
+# -------------------------------
+target_sum <- colSums(
+  rel_abund[target_asvs, , drop = FALSE]
+)
+
+# Create dataframe
+target_df <- data.frame(
+  sample_ID = names(target_sum),
+  rel_abundance_percent = target_sum
+)
+
+# -------------------------------
+# 4) Add metadata
+# -------------------------------
+meta <- fact_reordered %>%
+  as.data.frame() #%>%
+  #tibble::rownames_to_column("sample_ID")
+
+target_df <- target_df %>%
+  left_join(meta, by = "sample_ID")
+
+# -------------------------------
+# 5) Summary per species and stage
+# -------------------------------
+target_summary <- target_df %>%
+  group_by(seaweed, stage) %>%
+  summarise(
+    mean_percent = mean(rel_abundance_percent, na.rm = TRUE),
+    sd = sd(rel_abundance_percent, na.rm = TRUE),
+    min = min(rel_abundance_percent, na.rm = TRUE),
+    max = max(rel_abundance_percent, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# -------------------------------
+# 6) Save outputs
+# -------------------------------
+# write.csv(
+#   target_df,
+#   "outputs/files/Selected_ASVs_relative_abundance_per_sample.csv",
+#   row.names = FALSE
+# )
+# 
+# write.csv(
+#   target_summary,
+#   "outputs/files/Selected_ASVs_relative_abundance_summary.csv",
+#   row.names = FALSE
+# )
+
+# -------------------------------
+# 7) Print quick check
+# -------------------------------
+print(head(target_df))
+print(target_summary)
+
+# -------------------------------
+# Mean relative abundance per seaweed
+# -------------------------------
+
+target_df_no_sw <- target_df %>%
+  filter(!sample_type %in% c("Seawater_I/II", "Seawater_III/IV"))
+
+target_seaweed_summary <- target_df_no_sw %>%
+  group_by(seaweed) %>%
+  summarise(
+    mean_percent = mean(rel_abundance_percent, na.rm = TRUE),
+    sd = sd(rel_abundance_percent, na.rm = TRUE),
+    min = min(rel_abundance_percent, na.rm = TRUE),
+    max = max(rel_abundance_percent, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+print(target_seaweed_summary)
+
+# Save it
+# write.csv(
+#   target_seaweed_summary,
+#   "outputs/files/Selected_ASVs_relative_abundance_per_seaweed.csv",
+#   row.names = FALSE
+# )
+
+target_df <- target_df %>%
+  filter(sample_type %in% c("U.australis_26_Stage_II", "U.australis_26_Stage_III", "U.australis_26_Stage_IV"))
+
+target_seaweed_summary <- target_df %>%
+  group_by(seaweed) %>%
+  summarise(
+    mean_percent = mean(rel_abundance_percent, na.rm = TRUE),
+    sd = sd(rel_abundance_percent, na.rm = TRUE),
+    min = min(rel_abundance_percent, na.rm = TRUE),
+    max = max(rel_abundance_percent, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+print(target_seaweed_summary)
+```
+
+
+MVABUND - U.australis
+```{r}
+library('mvabund')
+
+# import the ASV data, the sample names should be in the 1st column
+
+Ulva <- read.csv("cleaned_raw_data_Ulva.csv", row.names = 1)
+
+# factor for all samples
+Ulva.fact <- read.csv("cleaned_factors_Ulva.csv", row.names = 1)
+
+mv.Ulva <- mvabund(Ulva)
+
+# fit the model
+
+fit_mv.Ulva = manyglm(mv.Ulva ~ Parent + Stage, family = "negative.binomial", data = Ulva.fact, composition=TRUE)
+
+# Check the model fitting plotting the residuals
+# plot(fit_mv.ad1.control,vars=15)
+# plot(fit_mv.ad1.bs52_ad1,vars=15)
+# plot(fit_mv.ad1.bs23_ad1,vars=15)
+# plot(fit_mv.bs52_ad1.control,vars=15)
+# plot(fit_mv.bs23_ad1.control,vars=15)
+
+
+# run the statistical test
+
+anova.Ulva = anova(fit_mv.Ulva, nBoot=9999, p.uni="unadjusted")
+
+
+# Get the multivariate table and univariate p - output
+# uni - univariate tests
+#########################################################output#############
+
+# for the unadjusted p value
+
+r1 <- data.frame(anova.Ulva$table)
+write.csv(r1,"global_Ulva_unadjusted.csv")
+r2 <- data.frame(anova.Ulva$uni.p)
+write.csv(r2,"uni_Ulva_unadjusted.csv")
+
+save.image("Ulva_unadjusted")
+
+
+#p-values were adjusted using BH:
+#Run mvabund with UNADJUSTED (one factor design)
+anova.Ulva$table 
+length(which(anova.Ulva$uni.p[2,] < 0.05)) 
+diff_05_treat_unadj <- which(anova.Ulva$uni.p[2,] < 0.05)
+diff_unadj <- anova.Ulva$uni.p[2,]
+print(diff_unadj)
+
+# Adjusting p-values using the Benjamini-Hochberg method
+anova.Ulva_pvalues_adjusted <- p.adjust(diff_unadj, method = "BH")
+
+# Display adjusted p-values
+print(anova.Ulva_pvalues_adjusted)
+
+# Extract only significant adjusted p-values
+significant_adjusted_p_values <- anova.Ulva_pvalues_adjusted[anova.Ulva_pvalues_adjusted < 0.05]
+names(significant_adjusted_p_values) 
+print(significant_adjusted_p_values) 
+names_diff_pvalue_adj <- names(significant_adjusted_p_values)
+
+
+```
+MVABUND - H.banksii
+```{r}
+library('mvabund')
+
+# import the ASV data, the sample names should be in the 1st column
+
+hormosira <- read.csv("cleaned_raw_data_Hormosira.csv", row.names = 1)
+
+# factor for all samples
+hormosira.fact <- read.csv("cleaned_factors_Hormosira.csv", row.names = 1)
+
+mv.hormosira <- mvabund(hormosira)
+
+# fit the model
+
+fit_mv.hormosira = manyglm(mv.hormosira ~ Parent + Stage, family = "negative.binomial", data = hormosira.fact, composition=TRUE)
+
+# Check the model fitting plotting the residuals
+# plot(fit_mv.ad1.control,vars=15)
+# plot(fit_mv.ad1.bs52_ad1,vars=15)
+# plot(fit_mv.ad1.bs23_ad1,vars=15)
+# plot(fit_mv.bs52_ad1.control,vars=15)
+# plot(fit_mv.bs23_ad1.control,vars=15)
+
+
+# run the statistical test
+
+anova.hormosira = anova(fit_mv.hormosira, nBoot=9999, p.uni="unadjusted")
+
+
+# Get the multivariate table and univariate p - output
+# uni - univariate tests
+#########################################################output#############
+
+# for the unadjusted p value
+
+r1 <- data.frame(anova.hormosira$table)
+write.csv(r1,"global_hormosira_unadjusted.csv")
+r2 <- data.frame(anova.hormosira$uni.p)
+write.csv(r2,"uni_hormosira_unadjusted.csv")
+
+save.image("Hormosira_unadjusted")
+
+
+#p-values were adjusted using BH:
+#Run mvabund with UNADJUSTED (one factor design)
+anova.hormosira$table 
+length(which(anova.hormosira$uni.p[2,] < 0.05)) 
+diff_05_treat_unadj <- which(anova.hormosira$uni.p[2,] < 0.05)
+diff_unadj <- anova.hormosira$uni.p[2,]
+print(diff_unadj)
+
+# Adjusting p-values using the Benjamini-Hochberg method
+anova.hormosira_pvalues_adjusted <- p.adjust(diff_unadj, method = "BH")
+
+# Display adjusted p-values
+print(anova.hormosira_pvalues_adjusted)
+
+# Extract only significant adjusted p-values
+significant_adjusted_p_values <- anova.hormosira_pvalues_adjusted[anova.hormosira_pvalues_adjusted < 0.05]
+names(significant_adjusted_p_values) 
+print(significant_adjusted_p_values) 
+names_diff_pvalue_adj <- names(significant_adjusted_p_values)
+
+
+```
+MVABUND - D.pulchra
+```{r}
+library('mvabund')
+
+# import the ASV data, the sample names should be in the 1st column
+
+Delisea <- read.csv("cleaned_raw_data_Delisea.csv", row.names = 1)
+
+# factor for all samples
+Delisea.fact <- read.csv("cleaned_factors_Delisea.csv", row.names = 1)
+
+mv.Delisea <- mvabund(Delisea)
+
+# fit the model
+
+fit_mv.Delisea = manyglm(mv.Delisea ~ Parent + Stage, family = "negative.binomial", data = Delisea.fact, composition=TRUE)
+
+# Check the model fitting plotting the residuals
+# plot(fit_mv.ad1.control,vars=15)
+# plot(fit_mv.ad1.bs52_ad1,vars=15)
+# plot(fit_mv.ad1.bs23_ad1,vars=15)
+# plot(fit_mv.bs52_ad1.control,vars=15)
+# plot(fit_mv.bs23_ad1.control,vars=15)
+
+
+# run the statistical test
+
+anova.Delisea = anova(fit_mv.Delisea, nBoot=9999, p.uni="unadjusted")
+
+
+# Get the multivariate table and univariate p - output
+# uni - univariate tests
+#########################################################output#############
+
+# for the unadjusted p value
+
+r1 <- data.frame(anova.Delisea$table)
+write.csv(r1,"global_Delisea_unadjusted.csv")
+r2 <- data.frame(anova.Delisea$uni.p)
+write.csv(r2,"uni_Delisea_unadjusted.csv")
+
+save.image("Delisea_unadjusted")
+
+
+#p-values were adjusted using BH:
+#Run mvabund with UNADJUSTED (one factor design)
+anova.Delisea$table 
+length(which(anova.Delisea$uni.p[2,] < 0.05)) 
+diff_05_treat_unadj <- which(anova.Delisea$uni.p[2,] < 0.05)
+diff_unadj <- anova.Delisea$uni.p[2,]
+print(diff_unadj)
+
+# Adjusting p-values using the Benjamini-Hochberg method
+anova.Delisea_pvalues_adjusted <- p.adjust(diff_unadj, method = "BH")
+
+# Display adjusted p-values
+print(anova.Delisea_pvalues_adjusted)
+
+# Extract only significant adjusted p-values
+significant_adjusted_p_values <- anova.Delisea_pvalues_adjusted[anova.Delisea_pvalues_adjusted < 0.05]
+names(significant_adjusted_p_values) 
+print(significant_adjusted_p_values) 
+names_diff_pvalue_adj <- names(significant_adjusted_p_values)
+
+
+```
