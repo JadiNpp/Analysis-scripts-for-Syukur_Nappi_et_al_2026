@@ -10,7 +10,7 @@ The scripts implement the full analysis workflow, including data preprocessing, 
 ## Repository structure
 
 * `data/` – input data (raw or processed) - to add after the paper is accepted
-* `scripts/` – R scripts used for analysis
+* `scripts/` – R scripts used for analysis (.Rmd)
 * `figures/` – output figures generated from the analyses - to add after the paper is accepted
 
 ## Workflow
